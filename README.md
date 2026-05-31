@@ -10,10 +10,12 @@ Elm/Redux (state-as-value, time-travel), and `rr` (record-replay) — not the ma
 The primary user is an **AI** — authoring game logic and debugging running games. Every design choice
 is justified by one of those two jobs.
 
-> **Status:** Phases 1–3 are complete and verified — the foundation (the World as a value + pure
-> `step`), the deterministic system scheduler (§4), and events & causality (§5). The kernel runs
-> headless, end-to-end, with zero art, bit-identically across Debug/ReleaseSafe/ReleaseFast. See
-> [`PLAN.md`](./PLAN.md) for the full roadmap and [`SPEC.md`](./SPEC.md) for the design contract.
+> **Status:** Phases 1–6 are complete and verified — the foundation (the World as a value + pure
+> `step`), the deterministic scheduler (§4), events & causality (§5), the **VOPR** deterministic
+> simulator/defect-finder (§9), the **relational query surface** (§7), and **specs/invariants/temporal
+> properties** (§8). The kernel runs headless, end-to-end, with zero art, bit-identically across
+> Debug/ReleaseSafe/ReleaseFast. See [`PLAN.md`](./PLAN.md) for the full roadmap and
+> [`SPEC.md`](./SPEC.md) for the design contract.
 
 ---
 
@@ -50,17 +52,20 @@ zig build run      # build and run the CLI
 zig build          # build the CLI to zig-out/bin/gkz
 ```
 
-`zig build test` is the determinism gate: it runs **339 tests in all three optimize modes** and pins
-several digests (an end-to-end content hash, a per-tick hash-stream digest, and an event-log digest),
+`zig build test` is the determinism gate: it runs **612 tests in all three optimize modes** and pins a
+suite of digests — an end-to-end content hash, a per-tick hash-stream digest, an event-log digest, the
+VOPR's frozen replay constants, the eight query-result digests, and the violation/spec/metric digests —
 asserted identically in every mode. All three modes passing *proves* `Debug == ReleaseSafe ==
-ReleaseFast` bit-identity — including under integer overflow (which ReleaseFast does not trap), across
-permuted system execution order, and whether or not events are recorded.
+ReleaseFast` bit-identity: under integer overflow (which ReleaseFast does not trap), across permuted
+system execution order, whether or not events are recorded, regardless of physical table/log layout, and
+with invariant checks compiled in or out.
 
 ---
 
-## What's implemented (Phases 1–3)
+## What's implemented (Phases 1–6)
 
-The world is fully playable, testable, and fuzzable with **zero art** — abstract placeholders only.
+The world is fully playable, testable, fuzzable, queryable, and checkable with **zero art** — abstract
+placeholders only.
 
 ### Phase 1 — Foundation (SPEC §1–§3, §6)
 
@@ -106,6 +111,53 @@ Recording is *tiered*: off on the throughput path, switched on to re-run an inte
 inputs)` and reconstruct the full causal graph. Causal queries are backward graph-walks
 (`causeChain`) — the debugging primitive the kernel exists to provide.
 
+### Phase 4 — The VOPR: a deterministic simulator (SPEC §9)
+
+| Module (`src/vopr/`) | Responsibility |
+|---|---|
+| `run.zig` | The per-seed `Run` evidence bundle: `buildRun`/`worldAt`/`captureStream` + the per-tick hash stream |
+| `generator.zig` | Seeded input-stream policies (idle/scripted/random); `view` is the §10 agent seam |
+| `inject.zig` | Fault/timing injection — within-stage exec permutations + snapshot cadences (none may change the hash) |
+| `oracle.zig` | The ONE `Oracle`/`Defect` abstraction: `invariant`, `divergence`, `firstDivergentTick` |
+| `minimize.zig` · `vopr.zig` | Kind-locked delta-debug minimization; `sweep` + `provenanceRerun` |
+
+One `Oracle`/`Defect` unifies "a crash, an assertion failure, an invariant violation, and a hash
+divergence" as the same event class — a reproducible defect with an exact location. The capstone:
+an injected determinism bug (a system writing around its declared access) is **caught, bisected to the
+first tick, minimized to the smallest reproducing stream, and provenance-attached**; its correctly
+declared twin reports zero defects. An `OutOfMemory`-injection sweep proves the whole pipeline is
+leak-/double-free-safe.
+
+### Phase 5 — Introspection & relational query surface (SPEC §7)
+
+| Module (`src/query/`) | Responsibility |
+|---|---|
+| `term.zig` · `result.zig` | A uniform closed-tag `Value` substrate; `QueryResult` (canonical-sorted, deduped) + the GKZR1 wire codec |
+| `relations.zig` · `catalog.zig` | The five §7 relations (`component`/`event`/`caused_by`/`system`/`diverge`) + a self-describing catalog |
+| `diverge.zig` · `engine.zig` · `wire.zig` | Component-level `diverge`, `firstTickWhere`, `reach`; the `Query` request union; the zero-io `respond` seam |
+
+The AI reasons over the engine's **runtime self-model**, not source code: entities, components, events,
+causal edges, and the system dataflow graph are all queryable relations, with the four canonical shapes
+(*why* · *what-affects-X* · *where-did-it-break* · *reachability*). `system/3` reflection is generated
+from the §4 access sets, so it is always exact and never drifts. Results are a deterministic,
+canonically-ordered, build-mode-invariant pure function of observed state — proven by eight pinned
+result digests + a scramble-invariance gate.
+
+### Phase 6 — Specifications, invariants & properties (SPEC §8)
+
+| Module (`src/spec/`) | Responsibility |
+|---|---|
+| `atom.zig` · `invariant.zig` · `check.zig` | The `Atom`/multi-entity `Witness` substrate; state invariants; the every-tick `checkAll` hook (DCE'd in ReleaseFast) |
+| `trace.zig` · `temporal.zig` | An O(T) projected-scalar trace; seven closed temporal combinators (LTL-over-the-log) folded over it |
+| `metric.zig` · `relations.zig` | Integer intent-metrics + sweep aggregation; the `spec`/`violation` §7 relations |
+
+Machine-checkable intent: state invariants pin the offending tick + entities; temporal properties
+(`always`/`eventually`/`stable`/`monotonic_unless`/`until`/`precedes`/`responds`) catch the exact tick a
+property flips. Violations ride the VOPR's `sweep → minimize → provenance` as an additive defect kind.
+The **fun-oracle boundary** is enforced in the type system: invariants/properties return a *verdict* (the
+engine guarantees them); metrics return a *quantity* (the engine measures, never judges) — intent is
+exogenous, declared by the human/AI, never supplied by the kernel.
+
 ### Determinism contract (the spine)
 
 `step` is pure; the World is a value; all randomness is a keyed, counter-based pure function; the
@@ -117,15 +169,17 @@ raw memory, never hash-map order, never pointers, always little-endian). These r
 
 ## Roadmap
 
-Phases 1–3 are done. Later phases bolt onto clean seams without reworking the storage/serialize/hash
+Phases 1–6 are done. Later phases bolt onto clean seams without reworking the storage/serialize/hash
 contract:
 
 - **Phase 1** — Foundation ✅
 - **Phase 2** — Systems & deterministic scheduler ✅
 - **Phase 3** — Events & causality ✅
-- **Phase 4** — The VOPR (deterministic simulator: fuzzing, divergence detection, minimal repro) ← *next*
-- **Phase 5** — Introspection & relational query surface (§7)
-- **Phase 6+** — Invariants/properties, agent harnesses, hot-reload & migration, process model
+- **Phase 4** — The VOPR (deterministic simulator: fuzzing, divergence detection, minimal repro) ✅
+- **Phase 5** — Introspection & relational query surface (§7) ✅
+- **Phase 6** — Specifications, invariants & properties (§8) ✅
+- **Phase 7** — Agent harnesses & evaluation (§10): `observe(State)->Input` policies, mass faster-than-realtime runs ← *next*
+- **Phase 8+** — Hot-reload & migration (§12), process model & control plane (§13)
 - **Phase 2b** — real thread-pool execution (the scheduler architecture already makes it safe)
 
 See [`PLAN.md`](./PLAN.md) §6 for the full phase map.
