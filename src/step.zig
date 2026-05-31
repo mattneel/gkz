@@ -54,6 +54,25 @@ pub fn stepRec(
     comptime systems: []const Sys(R),
     rec: ?*recorder.Recorder,
 ) std.mem.Allocator.Error!worldmod.World(R) {
+    // The canonical, comptime-derived stage order.
+    const exec = comptime &schedule.Schedule(R, systems).exec_order;
+    return stepExec(R, gpa, prev, in, systems, exec, rec);
+}
+
+/// `stepRec` with an EXPLICIT system execution order — the full per-tick transform (clone, advance,
+/// apply input commands, run systems in `exec` order, drain) parameterized by `exec`. `exec` must be a
+/// permutation of `[0, systems.len)` (the VOPR passes stage-respecting permutations as fault injection;
+/// `stepRec`/`step` pass the canonical `Schedule.exec_order`). Unlike `runScheduled`, this includes the
+/// input-command prologue and the tick advance, so it is the entry the VOPR drives.
+pub fn stepExec(
+    comptime R: type,
+    gpa: std.mem.Allocator,
+    prev: worldmod.World(R),
+    in: Input,
+    comptime systems: []const Sys(R),
+    exec: []const u16,
+    rec: ?*recorder.Recorder,
+) std.mem.Allocator.Error!worldmod.World(R) {
     var w = try prev.clone(gpa);
     errdefer w.deinit(gpa);
 
@@ -66,8 +85,6 @@ pub fn stepRec(
         if (mutation.commandToMutation(R, c)) |m| try mutation.apply(R, &w, gpa, m);
     }
 
-    // Scheduled systems, run in the deterministic comptime-derived order.
-    const exec = comptime &schedule.Schedule(R, systems).exec_order;
     try runScheduled(R, &w, gpa, systems, exec, rec);
     return w;
 }

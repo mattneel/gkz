@@ -4,14 +4,17 @@
 > order** it gets built, and records the architectural decisions made along the way. The primary user
 > is an AI; every decision below favors determinism, legibility, and a tight feedback loop.
 
-Status: **Phases 1–3 implemented; all determinism gates green; adversarial reviews passed.**
-**Phase 1 (Foundation)** + **Phase 2 (Systems & scheduler, §4)** + **Phase 3 (Events & causality, §5)**
-are complete: **327 tests** across Debug/ReleaseSafe/ReleaseFast — pinned end-to-end + per-tick-stream
-hashes (cross-build bit-identity, D2), an order-permutation gate (execution-order independence), and an
-events-OFF==events-ON hash-invariance gate + a pinned event-log digest (provenance is deterministic and
-never perturbs state). Phase 1 = `a589d39`, Phase 2 = `37748cf`; Phase 3 pending commit (review in
-progress). Adversarial reviews so far: 37 findings (31 confirmed, none critical/high), all fixed or
-documented (§7). This document is the decision of record. It was produced from a
+Status: **Phases 1–4 implemented; all determinism gates green; adversarial reviews passed.**
+**Foundation (§1–§3/§6)** + **Systems & scheduler (§4)** + **Events & causality (§5)** + **the VOPR
+(§9)** are complete: **390 tests** across Debug/ReleaseSafe/ReleaseFast — pinned end-to-end +
+per-tick-stream hashes (cross-build bit-identity, D2), an order-permutation gate (execution-order
+independence), an events-OFF==events-ON hash-invariance gate + a pinned event-log digest, the VOPR
+capstone (an injected determinism bug is caught/bisected/minimized/explained; a clean schedule reports
+zero defects), and an `OutOfMemory`-injection sweep that proves the whole VOPR pipeline is leak-/double-
+free-safe. Commits: Phase 1 `a589d39`, Phase 2 `37748cf`, Phase 3 `1a33f29`; Phase 4 lands in this
+commit (adversarial review 16/16 confirmed — two HIGH fixed: provenance now re-anchors at the
+minimized failing tick, and ownership is taken before the first fallible call in `buildRun`/capture).
+This document is the decision of record. It was produced from a
 3-architecture judge panel (5 independent lenses + synthesis) over ground truth extracted from
 SPEC.md, the `fpz` dependency, and the live Zig 0.16.0 toolchain.
 
@@ -305,7 +308,7 @@ Phase-1 `deferred_with_seams` provisions, so later phases bolt on without rework
 | **2. Systems & deterministic scheduler** ✅ | §4 | comptime `Read/Write/With/Without` access sets; `@compileError`-gated `Query`; DAG conflict detection `(writeA & (readB\|writeB))` → greedy comptime stages; per-system **command buffers** drained at one end-of-tick sync point in **`(system_id, seq)`** order (corrects the non-total "(system_id, entity_id)"); restricted `SimCtx`; single-thread + an **order-permutation determinism gate**. Real threads = 2b. | **S1, S2** |
 | *2b. SIMD/archetype upgrade (perf track)* | §3 | swap flat table → archetype tables behind the storage seam; SIMD batch path via `fpz.simd`. Hash/serialize/`step` unchanged. Extend cross-build gate to scalar-vs-SIMD overflow. | **S1** (sealed upgrade) |
 | **3. Events & causality** ✅ | §5 | recording `EventEmitter` threaded through `SimCtx` into a **side** `EventLog` (owned by a `Recorder`, never in the hashed World); structural `EventId` + a **distinct, component-storable `CauseToken`** (storing an `EventId` in a component is a compile error); auto-attributed `SystemCause` nodes + cross-tick `causeTokenHere`/`causeFromToken`; `causesOf`/`causeChain` backward-walk; tiered on/off recording. **Events are hash-invariant** (events-OFF == events-ON, gated). Typed payload decode + the §7 relational surface deferred. | **S3** |
-| **4. VOPR** | §9 | seeded input driver; fault/timing injection (none may change the hash); property checking across seeds; divergence detection (the Phase-1 hash-stream compare, scaled); delta-debugged minimal `(seed,inputs)` repro. | reuses gate-3 harness |
+| **4. VOPR** ✅ | §9 | one `Oracle`/`Defect` abstraction (invariant · divergence; crash/`.trap` deferred to the build-mode/process boundary); seeded pluggable `Generator`; fault/timing injection (within-stage exec permutation + snapshot-cadence round-trip — none may change the per-tick hash) with first-tick bisection; kind-locked delta-debug minimization; provenance re-run (`causeChain`) on a hit; `sweep` a pure function of a seed range (the §13 sharding seam). Capstone: an undeclared-write system is caught/bisected/minimized/explained; the correct twin → zero defects. | reuses step/runScheduled/snapshot/digest/Recorder |
 | **5. Query surface** | §7 | Datalog-ish relations (`component/3`, `event/5`, `caused_by/2`, `system/3`, `diverge/3`) over a socket; reflection from §4 access sets. | **S5** |
 | **6. Specs / invariants / properties** | §8 | state invariants; temporal/LTL properties over the trace; intent-metrics over agent runs. | **S8** |
 | **7. Agent harnesses & evaluation** | §10 | `observe(State)->Input` policies (scripted/search/learned); mass faster-than-realtime evaluation; aggregate intent-metrics. NN inference is the *player*, not the *world*. | reuses Input channel |
@@ -388,3 +391,37 @@ netcode, asset import, editor) are out of kernel scope (§15) — only their one
 17. **`readLog` hardened for untrusted bytes** (fixed). Validates declared sizes against the buffer
     before allocating (no unbounded reservation) and each event's offsets against the arenas (no OOB in
     `causesOf`/`payloadOf`); arena lengths assert a 4 GB ceiling. *(zig#1, zig#2, memory#0.)*
+
+### Phase 4 notes (from the Phase-4 adversarial review — 16/16 confirmed; two HIGH + the rest fixed/documented)
+
+18. **Provenance re-anchors at the MINIMIZED failing tick** (HIGH, fixed). Minimization renumbers ticks
+    (dropping leading no-ops moves the failing tick earlier), so anchoring `provenanceRerun` at the
+    *original* `d.tick` silently produced an empty/wrong cause chain on any defect that wasn't already at
+    tick 1. `sweep` now re-evaluates the oracle on the minimized stream to get the post-minimization
+    defect (`d_min`), stores *that* in the report, and anchors provenance at `d_min.tick`. Regression: a
+    defect first appearing at tick 5 with two droppable leading ticks minimizes to tick 3 — the report
+    tick is 3 and the chain is non-empty. *(soundness#0 / zig#0.)*
+19. **Ownership is taken before the first fallible call** (HIGH, fixed). `buildRun` (and, found by the new
+    OOM-injection test, `captureStream` / `captureStreamCadence`) consumed a `World` by value but ran a
+    fallible allocation — the snapshot, resp. the `hashes` alloc — *before* registering `errdefer
+    w.deinit`, leaking the consumed World on OOM. Each now does `var w = w0; errdefer w.deinit(gpa);`
+    first. Likewise `provenanceRerun` had an explicit `w.deinit` *plus* an `errdefer w.deinit` (a trailing
+    `causeChain` OOM would double-free) — collapsed to one `defer`. `sweep`'s `cause_chain` gets an
+    `errdefer gpa.free` between build and append. A `checkAllAllocationFailures` sweep over the full
+    pipeline now proves leak-/double-free-freedom. *(memory#0, memory#1 + two bonus catches.)*
+20. **`enumerate` guarantees non-identity exec-permutation coverage** (LOW, fixed). `execPermutation` was a
+    seed-keyed Fisher-Yates that could (≈2^-budget) emit only identities for a small racy stage —
+    a false-negative coverage gap. It is now a deterministic, seed-independent per-stage left-rotation:
+    `perm_index == 1` rotates every multi-member stage by 1 (a guaranteed swap for size 2), so
+    `enumerate(budget ≥ 2)` always covers a real reordering. A test wires `enumerate` into the leaky
+    sweep and confirms the divergence is caught with no hand-picked index. Rotation covers the
+    neighbour-order classes that matter for detecting order-dependence; full-permutation enumeration of a
+    stage is a later enhancement. *(soundness#1, tests#6.)*
+21. **Hardening + recorded deferrals** (the remaining mediums/lows/nits). The cadence (snapshot/restore)
+    path now has an identity test (cadence-k hashes == continuous), `randomGen` is driven end-to-end
+    through a sweep against an invariant, the divergence `firstDivergentTick` detail read is length-
+    guarded, and the divergence `Defect.Detail.hashes` is documented as (seed, tick)-only — per-component
+    /per-system bisection of *which* write diverged needs the §7 typed-component diff and is deferred, as
+    is input-command provenance at the bottom of a chain (shared with Phase 3 note 15). Command-buffer
+    apply-timing is *subsumed* by `exec_perm` (the drain is already `(system_id, seq)`-ordered and
+    exec-order-independent), documented in `inject.zig`. *(tests#0/#2/#4/#5, zig#1, spec#0/#1/#2.)*

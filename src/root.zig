@@ -75,6 +75,13 @@ pub const Recorder = recorder_mod.Recorder;
 
 pub const EventEmitter = simctx.EventEmitter;
 
+// --- Phase 4: the VOPR — deterministic simulator / fuzzer-debugger (SPEC §9) ---
+pub const vopr = @import("vopr/vopr.zig");
+pub const Oracle = @import("vopr/oracle.zig").Oracle;
+pub const Defect = @import("vopr/oracle.zig").Defect;
+pub const Generator = @import("vopr/generator.zig").Generator;
+pub const sweep = vopr.sweep;
+
 pub const snapshot_mod = @import("snapshot.zig");
 pub const Snapshot = snapshot_mod.Snapshot;
 pub const snapshot = snapshot_mod.snapshot;
@@ -111,4 +118,10 @@ test {
     _ = event;
     _ = event_log;
     _ = recorder_mod;
+    _ = @import("vopr/run.zig");
+    _ = @import("vopr/generator.zig");
+    _ = @import("vopr/inject.zig");
+    _ = @import("vopr/oracle.zig");
+    _ = @import("vopr/minimize.zig");
+    _ = vopr;
 }
