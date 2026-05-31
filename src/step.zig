@@ -25,6 +25,7 @@ const mutation = @import("mutation.zig");
 const schedule = @import("schedule.zig");
 const simctx = @import("simctx.zig");
 const cmdbuf = @import("command_buffer.zig");
+const recorder = @import("recorder.zig");
 const sortmod = @import("sort.zig");
 const Input = input.Input;
 const Sys = schedule.Sys;
@@ -37,6 +38,21 @@ pub fn step(
     prev: worldmod.World(R),
     in: Input,
     comptime systems: []const Sys(R),
+) std.mem.Allocator.Error!worldmod.World(R) {
+    return stepRec(R, gpa, prev, in, systems, null);
+}
+
+/// `step` with an optional provenance Recorder (SPEC §5, §2.6). `rec == null` is the throughput
+/// default (no events). A live Recorder records the deterministic event log for this tick WITHOUT
+/// changing the returned World or its hash — events are pure side-output. The §9 VOPR re-runs an
+/// interesting (seed, inputs) by swapping `null` for a Recorder here.
+pub fn stepRec(
+    comptime R: type,
+    gpa: std.mem.Allocator,
+    prev: worldmod.World(R),
+    in: Input,
+    comptime systems: []const Sys(R),
+    rec: ?*recorder.Recorder,
 ) std.mem.Allocator.Error!worldmod.World(R) {
     var w = try prev.clone(gpa);
     errdefer w.deinit(gpa);
@@ -52,7 +68,7 @@ pub fn step(
 
     // Scheduled systems, run in the deterministic comptime-derived order.
     const exec = comptime &schedule.Schedule(R, systems).exec_order;
-    try runScheduled(R, &w, gpa, systems, exec);
+    try runScheduled(R, &w, gpa, systems, exec, rec);
     return w;
 }
 
@@ -66,6 +82,7 @@ pub fn runScheduled(
     gpa: std.mem.Allocator,
     comptime systems: []const Sys(R),
     exec: []const u16,
+    rec: ?*recorder.Recorder,
 ) std.mem.Allocator.Error!void {
     // Precondition: `exec` is a permutation of [0, systems.len) — each system runs exactly once. The
     // production caller passes `Schedule.exec_order`; the order-permutation gate passes valid within-
@@ -87,7 +104,9 @@ pub fn runScheduled(
         defer {
             inline for (0..systems.len) |i| bufs[i].deinit();
         }
-        var ev = simctx.EventEmitter{};
+        // One emitter for the whole tick: recording into `rec` if present, else a no-op. Each SimCtx
+        // points at it and supplies its own system_id; `emit_ordinal` defaults to 0 per invocation.
+        var emitter: simctx.EventEmitter = if (rec) |r| .{ .recording = r } else .noop;
 
         for (exec) |sid| {
             var ctx = SimCtx(R){
@@ -95,7 +114,7 @@ pub fn runScheduled(
                 .rng_root = w.rng_root,
                 .system_id = sid,
                 .cmd = &bufs[sid],
-                .events = &ev,
+                .events = &emitter,
             };
             try systems[sid].invoke(&ctx, &w.table, order);
         }
@@ -297,12 +316,12 @@ test "(system_id, seq) drain order: highest system_id wins, invariant to within-
     var a = try w0.clone(gpa);
     defer a.deinit(gpa);
     a.tick +%= 1;
-    try runScheduled(Reg, &a, gpa, &setters, &[_]u16{ 0, 1, 2 }); // canonical
+    try runScheduled(Reg, &a, gpa, &setters, &[_]u16{ 0, 1, 2 }, null); // canonical
 
     var b = try w0.clone(gpa);
     defer b.deinit(gpa);
     b.tick +%= 1;
-    try runScheduled(Reg, &b, gpa, &setters, &[_]u16{ 2, 0, 1 }); // within-stage permutation
+    try runScheduled(Reg, &b, gpa, &setters, &[_]u16{ 2, 0, 1 }, null); // within-stage permutation
 
     try testing.expectEqual((try a.digest(gpa)).hash, (try b.digest(gpa)).hash);
     // setC (highest system_id) applied last -> wins

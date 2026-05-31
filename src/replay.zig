@@ -165,7 +165,7 @@ fn runTrajectory(gpa: std.mem.Allocator, ticks: usize, exec: []const u16) !struc
     var t: usize = 0;
     while (t < ticks) : (t += 1) {
         w.tick +%= 1;
-        try stepmod.runScheduled(Reg, &w, gpa, &sys3, exec);
+        try stepmod.runScheduled(Reg, &w, gpa, &sys3, exec, null);
         var b: [8]u8 = undefined;
         std.mem.writeInt(u64, &b, (try w.digest(gpa)).hash, .little);
         stream.update(&b);
@@ -202,4 +202,201 @@ test "addSat saturates without overflow panic through a Query write (gate 4)" {
     var next = try stepmod.step(Reg, gpa, w, .{ .tick = 1, .commands = &.{} }, &sys3);
     defer next.deinit(gpa);
     try testing.expect(next.get(e, Position).?.x.raw <= fpz.Fixed.MAX.raw);
+}
+
+// ===================================================================================================
+// Phase 3: events & causality — the worked cross-tick cause chain + the determinism gates
+// ===================================================================================================
+//
+// A 2-tick cycle that exercises emit + cross-tick CauseToken threading (the SPEC §5 DamageEvent <-
+// CollisionEvent shape across Phase-2's one-tick structural latency):
+//   Tick T   — sparkSystem (entities WITH Charge, WITHOUT Pending): emit Spark; defer set Pending{cause=token-of-Spark}.
+//   Tick T+1 — boomSystem (entities WITH Pending): emit Boom caused by the Spark the token names; defer remove Pending.
+// `Pending.cause` is a CauseToken (hash-safe), never an EventId — so the World hash is identical
+// whether events are recorded or not, while a recording run reproduces the full causal graph.
+
+const event = @import("event.zig");
+const recorder = @import("recorder.zig");
+const event_log = @import("event_log.zig");
+const serialize = @import("serialize.zig");
+const With = query.With;
+const Without = query.Without;
+const Recorder = recorder.Recorder;
+
+const Charge = struct {
+    n: i32,
+    pub const kind_id: u16 = 1;
+};
+const Pending = struct {
+    cause: event.CauseToken, // hash-safe event handle; an EventId here would be a compile error
+    pub const kind_id: u16 = 2;
+};
+const PReg = Registry(.{ Charge, Pending });
+const PW = worldmod.World(PReg);
+
+const Spark = struct {
+    from: Entity,
+    pub const kind_id: u16 = 100;
+};
+const Boom = struct {
+    at: Entity,
+    pub const kind_id: u16 = 101;
+};
+
+fn sparkSystem(ctx: *SimCtx(PReg), q: *Query(PReg, .{ Read(Charge), Without(Pending) })) std.mem.Allocator.Error!void {
+    while (q.next()) |row| {
+        const e = row.entity();
+        const tok = ctx.causeTokenHere(); // names the Spark we are about to emit
+        _ = try ctx.emitS(Spark, e, .{ .from = e });
+        try ctx.cmd.set(e, Pending, .{ .cause = tok }); // hash-safe token stored in state
+    }
+}
+fn boomSystem(ctx: *SimCtx(PReg), q: *Query(PReg, .{Read(Pending)})) std.mem.Allocator.Error!void {
+    while (q.next()) |row| {
+        const e = row.entity();
+        const cid = ctx.causeFromToken(row.read(Pending).cause); // resolve the cross-tick cause
+        _ = try ctx.emit(Boom, e, .{ .at = e }, &.{cid});
+        try ctx.cmd.remove(e, Pending);
+    }
+}
+const prov_systems = [_]Sys(PReg){ system(PReg, "spark", sparkSystem), system(PReg, "boom", boomSystem) };
+
+const PROV_TICKS: usize = 6;
+
+fn seedProv(gpa: std.mem.Allocator, n: u32) !PW {
+    var w = PW.init(0xC0DE);
+    errdefer w.deinit(gpa);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const e = try w.spawn(gpa);
+        w.add(e, Charge, .{ .n = @intCast(i) });
+    }
+    return w;
+}
+
+/// Run the provenance scenario, returning the final-state hash + per-tick-stream digest. `rec`
+/// (optional) records the event log.
+fn runProv(gpa: std.mem.Allocator, ticks: usize, rec: ?*Recorder) !struct { final: u64, stream: u64 } {
+    var w = try seedProv(gpa, 3);
+    defer w.deinit(gpa);
+    var stream = std.hash.XxHash64.init(0);
+    var t: usize = 0;
+    while (t < ticks) : (t += 1) {
+        const next = try stepmod.stepRec(PReg, gpa, w, .{ .tick = @intCast(t + 1), .commands = &.{} }, &prov_systems, rec);
+        w.deinit(gpa);
+        w = next;
+        var b: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b, (try w.digest(gpa)).hash, .little);
+        stream.update(&b);
+    }
+    return .{ .final = (try w.digest(gpa)).hash, .stream = stream.final() };
+}
+
+test "HASH-INVARIANCE: recording events does not perturb the World hash (events-OFF == events-ON)" {
+    const gpa = testing.allocator;
+    const off = try runProv(gpa, PROV_TICKS, null);
+    var rec = Recorder.init(gpa);
+    defer rec.deinit();
+    const on = try runProv(gpa, PROV_TICKS, &rec);
+    // the stored CauseToken is identical on/off (causeTokenHere is recorder-independent), so the
+    // World — final state AND every tick's hash — is bit-identical whether or not events are recorded.
+    try testing.expectEqual(off.final, on.final);
+    try testing.expectEqual(off.stream, on.stream);
+    try testing.expect(rec.log.count() > 0); // ...and the recording run actually produced events
+}
+
+test "PROVENANCE DETERMINISM + cross-tick cause chain: Boom traces back to its Spark across a tick" {
+    const gpa = testing.allocator;
+    var rec1 = Recorder.init(gpa);
+    defer rec1.deinit();
+    _ = try runProv(gpa, PROV_TICKS, &rec1);
+
+    // a second recording run from the same (seed, inputs) yields a bit-identical log
+    var rec2 = Recorder.init(gpa);
+    defer rec2.deinit();
+    _ = try runProv(gpa, PROV_TICKS, &rec2);
+    try testing.expectEqual(event_log.logDigest(&rec1.log).hash, event_log.logDigest(&rec2.log).hash);
+
+    // find a Boom event, follow its explicit cause edge to a Spark, and assert the Spark is the one
+    // for the SAME entity a tick earlier (Boom[e] <- Spark[e]) — proving the token<->seq lockstep
+    // resolves precisely, not just "reaches some Spark".
+    var boom: ?event.Event = null;
+    for (rec1.log.events.items) |e| {
+        if (e.kind == Boom.kind_id) {
+            boom = e;
+            break;
+        }
+    }
+    try testing.expect(boom != null);
+    // the Boom's causes are [SystemCause, the resolved Spark id]; find the Spark among them
+    var spark_ev: ?event.Event = null;
+    for (rec1.log.causesOf(boom.?.id)) |c| {
+        for (rec1.log.events.items) |ev| {
+            if (ev.id.eql(c) and ev.kind == Spark.kind_id) spark_ev = ev;
+        }
+    }
+    try testing.expect(spark_ev != null);
+    // decode the Spark payload and assert it names the same entity as the Boom, one tick earlier
+    var rd = serialize.ByteReader{ .bytes = rec1.log.payloadOf(spark_ev.?.id) };
+    const spark = try serialize.readValue(Spark, &rd);
+    try testing.expectEqual(boom.?.subject, spark.from); // same entity
+    try testing.expectEqual(boom.?.id.tick, spark_ev.?.id.tick + 1); // exactly one tick earlier
+}
+
+test "two systems emitting in one tick produce distinct SystemCause nodes (through the scheduler)" {
+    const gpa = testing.allocator;
+    var rec = Recorder.init(gpa);
+    defer rec.deinit();
+    _ = try runProv(gpa, PROV_TICKS, &rec);
+    // SystemCause nodes are {tick, RESERVED_SYSACT, system_id}; system 0 = spark, system 1 = boom.
+    var have_spark_sa = false;
+    var have_boom_sa = false;
+    for (rec.log.events.items) |e| {
+        if (e.emitter == event.RESERVED_SYSACT) {
+            if (e.id.seq == 0) have_spark_sa = true;
+            if (e.id.seq == 1) have_boom_sa = true;
+        }
+    }
+    try testing.expect(have_spark_sa and have_boom_sa);
+}
+
+test "PINNED event-log digest (cross-build gate: Debug == ReleaseSafe == ReleaseFast)" {
+    const gpa = testing.allocator;
+    var rec = Recorder.init(gpa);
+    defer rec.deinit();
+    _ = try runProv(gpa, PROV_TICKS, &rec);
+    try testing.expectEqual(@as(u64, 4135464368202209963), event_log.logDigest(&rec.log).hash); // frozen event-log fingerprint
+}
+
+test "tiered re-run: snapshot + replay with a Recorder reproduces the same state AND a deterministic log" {
+    const gpa = testing.allocator;
+    // live run to a mid point, snapshot
+    var w = try seedProv(gpa, 3);
+    var t: usize = 0;
+    while (t < 3) : (t += 1) {
+        const next = try stepmod.step(PReg, gpa, w, .{ .tick = @intCast(t + 1), .commands = &.{} }, &prov_systems);
+        w.deinit(gpa);
+        w = next;
+    }
+    var snap = try snapshotmod.snapshot(PReg, gpa, &w);
+    defer snap.deinit(gpa);
+    w.deinit(gpa);
+
+    // re-run tick 4 from the snapshot WITHOUT a recorder (the throughput path)
+    var a = try snapshotmod.restore(PReg, gpa, snap);
+    var a2 = try stepmod.step(PReg, gpa, a, .{ .tick = 4, .commands = &.{} }, &prov_systems);
+    a.deinit(gpa);
+    defer a2.deinit(gpa);
+
+    // re-run tick 4 from the SAME snapshot WITH a recorder (the §9 VOPR provenance re-run seam)
+    var b = try snapshotmod.restore(PReg, gpa, snap);
+    var rec = Recorder.init(gpa);
+    defer rec.deinit();
+    var b2 = try stepmod.stepRec(PReg, gpa, b, .{ .tick = 4, .commands = &.{} }, &prov_systems, &rec);
+    b.deinit(gpa);
+    defer b2.deinit(gpa);
+
+    // recorder-on reproduces the same state as recorder-off (events are side-output) and logs events
+    try testing.expectEqual((try a2.digest(gpa)).hash, (try b2.digest(gpa)).hash);
+    try testing.expect(rec.log.count() > 0);
 }

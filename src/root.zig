@@ -58,7 +58,22 @@ pub const Schedule = schedule.Schedule;
 
 pub const step_mod = @import("step.zig");
 pub const step = step_mod.step;
+pub const stepRec = step_mod.stepRec;
 pub const runScheduled = step_mod.runScheduled;
+
+// --- Phase 3: events & causality / provenance (SPEC §5) ---
+pub const event = @import("event.zig");
+pub const EventId = event.EventId;
+pub const CauseToken = event.CauseToken;
+pub const Event = event.Event;
+
+pub const event_log = @import("event_log.zig");
+pub const EventLog = event_log.EventLog;
+
+pub const recorder_mod = @import("recorder.zig");
+pub const Recorder = recorder_mod.Recorder;
+
+pub const EventEmitter = simctx.EventEmitter;
 
 pub const snapshot_mod = @import("snapshot.zig");
 pub const Snapshot = snapshot_mod.Snapshot;
@@ -93,4 +108,7 @@ test {
     _ = step_mod;
     _ = snapshot_mod;
     _ = replay_mod;
+    _ = event;
+    _ = event_log;
+    _ = recorder_mod;
 }

@@ -4,12 +4,14 @@
 > order** it gets built, and records the architectural decisions made along the way. The primary user
 > is an AI; every decision below favors determinism, legibility, and a tight feedback loop.
 
-Status: **Phases 1–2 implemented; all determinism gates green; both adversarial reviews passed.**
-**Phase 1 (Foundation)** + **Phase 2 (Systems & deterministic scheduler, §4)** are complete: **279 tests**
-passing across Debug/ReleaseSafe/ReleaseFast, with pinned end-to-end + per-tick-stream hashes proving
-cross-build bit-identity (D2) and an order-permutation gate proving execution-order independence. Two
-5-lens adversarial reviews raised 37 findings (31 confirmed, none critical/high); all fixed or
-documented (see §7). Phase 1 committed as `a589d39`; Phase 2 pending commit. This document is the decision of record. It was produced from a
+Status: **Phases 1–3 implemented; all determinism gates green; adversarial reviews passed.**
+**Phase 1 (Foundation)** + **Phase 2 (Systems & scheduler, §4)** + **Phase 3 (Events & causality, §5)**
+are complete: **327 tests** across Debug/ReleaseSafe/ReleaseFast — pinned end-to-end + per-tick-stream
+hashes (cross-build bit-identity, D2), an order-permutation gate (execution-order independence), and an
+events-OFF==events-ON hash-invariance gate + a pinned event-log digest (provenance is deterministic and
+never perturbs state). Phase 1 = `a589d39`, Phase 2 = `37748cf`; Phase 3 pending commit (review in
+progress). Adversarial reviews so far: 37 findings (31 confirmed, none critical/high), all fixed or
+documented (§7). This document is the decision of record. It was produced from a
 3-architecture judge panel (5 independent lenses + synthesis) over ground truth extracted from
 SPEC.md, the `fpz` dependency, and the live Zig 0.16.0 toolchain.
 
@@ -302,7 +304,7 @@ Phase-1 `deferred_with_seams` provisions, so later phases bolt on without rework
 | **1. Foundation** *(this plan)* | §1,2,3,6 | ECS-as-value, pure `step`, canonical serialize+hash, snapshot, deterministic replay, cross-build gate. | — establishes all |
 | **2. Systems & deterministic scheduler** ✅ | §4 | comptime `Read/Write/With/Without` access sets; `@compileError`-gated `Query`; DAG conflict detection `(writeA & (readB\|writeB))` → greedy comptime stages; per-system **command buffers** drained at one end-of-tick sync point in **`(system_id, seq)`** order (corrects the non-total "(system_id, entity_id)"); restricted `SimCtx`; single-thread + an **order-permutation determinism gate**. Real threads = 2b. | **S1, S2** |
 | *2b. SIMD/archetype upgrade (perf track)* | §3 | swap flat table → archetype tables behind the storage seam; SIMD batch path via `fpz.simd`. Hash/serialize/`step` unchanged. Extend cross-build gate to scalar-vs-SIMD overflow. | **S1** (sealed upgrade) |
-| **3. Events & causality** | §5 | event emitter threaded through `SimCtx` into a **side** log (never in the hashed World); causal graph; tiered (on-demand) provenance recording. | **S3** |
+| **3. Events & causality** ✅ | §5 | recording `EventEmitter` threaded through `SimCtx` into a **side** `EventLog` (owned by a `Recorder`, never in the hashed World); structural `EventId` + a **distinct, component-storable `CauseToken`** (storing an `EventId` in a component is a compile error); auto-attributed `SystemCause` nodes + cross-tick `causeTokenHere`/`causeFromToken`; `causesOf`/`causeChain` backward-walk; tiered on/off recording. **Events are hash-invariant** (events-OFF == events-ON, gated). Typed payload decode + the §7 relational surface deferred. | **S3** |
 | **4. VOPR** | §9 | seeded input driver; fault/timing injection (none may change the hash); property checking across seeds; divergence detection (the Phase-1 hash-stream compare, scaled); delta-debugged minimal `(seed,inputs)` repro. | reuses gate-3 harness |
 | **5. Query surface** | §7 | Datalog-ish relations (`component/3`, `event/5`, `caused_by/2`, `system/3`, `diverge/3`) over a socket; reflection from §4 access sets. | **S5** |
 | **6. Specs / invariants / properties** | §8 | state invariants; temporal/LTL properties over the trace; intent-metrics over agent runs. | **S8** |
@@ -363,3 +365,26 @@ netcode, asset import, editor) are out of kernel scope (§15) — only their one
 13. **Reflection negative cases are documented, not mechanically tested.** `Query.read`/`write` misuse
     and malformed `system()` fns are `@compileError`s (verified by design; `system()` now emits clear
     messages), but a failing-compile CI fixture is deferred. *(Review finding zig#1/tests#8, accepted.)*
+
+### Phase 3 notes (from the Phase-3 adversarial review — 14/16 confirmed, one HIGH fixed, rest fixed/documented)
+
+14. **Event payload ceiling = 64 KB** (fixed). `Event.payload_len` is a `u16`; a `>64KB`-serialized
+    event type is now a **compile error** (`comptime` assert in `recorder.record`), matching the
+    command-buffer ceiling — closing a HIGH-severity D2 build-mode divergence (ReleaseFast would have
+    silently truncated the recorded log while Debug/ReleaseSafe trapped). *(zig#0/determinism#0.)*
+15. **Input/command provenance is deferred.** Phase 3 auto-attributes each event to a per-(tick,system)
+    `SystemCause` root node; the bottom of SPEC §5's canonical chain (`… ← input command`) is not yet
+    represented, because the Phase-2 input path applies structural commands without an emitter. SPEC §5's
+    example is thus *partially* realized (event ← system ← … holds; ← input deferred). Lands when the
+    input path gains emission. *(spec#0, accepted.)*
+16. **Event-log physical order = system execution order.** `EventId` *identity* is structural and
+    `causeChain` output is canonically sorted, so causal *queries* are order-independent — but the log's
+    physical array order (and thus `logDigest`) follows the order systems ran. Canonical today
+    (single-threaded, canonical `exec_order`; the order-permutation gate runs permutations with
+    recording **off**). **Phase 2b** (real within-stage threads) must record into per-system sub-logs
+    merged deterministically (e.g. by `EventId`) before `logDigest` is order-stable under parallelism;
+    the `cur_sa` single-slot `SystemCause` dedup likewise assumes serialized per-(tick,system) emission.
+    *(determinism#1 / spec#2, documented; a 2b seam.)*
+17. **`readLog` hardened for untrusted bytes** (fixed). Validates declared sizes against the buffer
+    before allocating (no unbounded reservation) and each event's offsets against the arenas (no OOB in
+    `causesOf`/`payloadOf`); arena lengths assert a 4 GB ceiling. *(zig#1, zig#2, memory#0.)*

@@ -146,6 +146,12 @@ pub fn Registry(comptime component_types: anytype) type {
                 .int, .bool => {},
                 .@"enum" => |e| assertSerializable(e.tag_type),
                 .@"struct" => |s| {
+                    // Forbid event-naming types (EventId) in hashed state: their value differs
+                    // events-on vs events-off, so storing one would diverge the content hash (Phase 3
+                    // iron #2). The storable substitute is CauseToken, which lacks this marker.
+                    if (@hasDecl(T, "__no_component_store")) {
+                        @compileError(@typeName(T) ++ " may not be stored in a component (it names an event; thread causality with CauseToken instead)");
+                    }
                     inline for (s.fields) |f| assertSerializable(f.type);
                 },
                 .array => |arr| assertSerializable(arr.child),
