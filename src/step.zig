@@ -150,6 +150,85 @@ pub fn runScheduled(
     }
 }
 
+// --- runtime-systems path (hot-reload / dlopen) ---------------------------------------------------
+//
+// `step`/`stepExec`/`runScheduled` take a `comptime systems` slice — the ONLY thing that forces comptime
+// is the fixed-size `[systems.len]CommandBuffer` stack array + the inline-for init/drain. A hot-reloaded
+// (dlopen'd) system set is only known at RUNTIME, so these siblings take `systems: []const Sys(R)` and
+// heap-allocate the command buffers instead. Everything else — clone, tick, input prologue, per-system
+// SimCtx, the `(system_id, seq)` drain — is byte-for-byte the same, so for any set expressible at comptime
+// the dynamic path produces an identical per-tick stream (asserted in the reload gate). This adds ZERO
+// code to the comptime path and does not touch its determinism gate.
+
+/// Runtime twin of `runScheduled` over a runtime `systems` slice (the dlopen entry). `exec` must be a
+/// permutation of `[0, systems.len)` — pass `schedule.execOrderDynamic(R, gpa, systems)`.
+pub fn runScheduledDynamic(
+    comptime R: type,
+    w: *worldmod.World(R),
+    gpa: std.mem.Allocator,
+    systems: []const Sys(R),
+    exec: []const u16,
+    rec: ?*recorder.Recorder,
+) std.mem.Allocator.Error!void {
+    std.debug.assert(exec.len == systems.len);
+    for (exec) |sid| std.debug.assert(sid < systems.len);
+    if (systems.len == 0) return;
+
+    const order = try w.table.canonicalOrder(gpa);
+    defer gpa.free(order);
+
+    const bufs = try gpa.alloc(cmdbuf.CommandBuffer(R), systems.len);
+    defer gpa.free(bufs);
+    for (bufs, 0..) |*b, i| b.* = cmdbuf.CommandBuffer(R).init(gpa, @intCast(i));
+    defer for (bufs) |*b| b.deinit();
+
+    var emitter: simctx.EventEmitter = if (rec) |r| .{ .recording = r } else .noop;
+
+    for (exec) |sid| {
+        var ctx = SimCtx(R){
+            .tick = w.tick,
+            .rng_root = w.rng_root,
+            .system_id = sid,
+            .cmd = &bufs[sid],
+            .events = &emitter,
+        };
+        try systems[sid].invoke(&ctx, &w.table, order);
+    }
+
+    var all: std.ArrayList(cmdbuf.Command(R)) = .empty;
+    defer all.deinit(gpa);
+    for (bufs) |*b| try all.appendSlice(gpa, b.list.items);
+    const Less = struct {
+        fn lt(_: void, a: cmdbuf.Command(R), b: cmdbuf.Command(R)) bool {
+            return if (a.system_id != b.system_id) a.system_id < b.system_id else a.seq < b.seq;
+        }
+    };
+    sortmod.sort(cmdbuf.Command(R), all.items, {}, Less.lt);
+    for (all.items) |c| try mutation.applyCommand(R, w, gpa, c);
+}
+
+/// Runtime twin of `stepExec`: the pure `(World, Input) -> World` over a runtime `systems` slice.
+pub fn stepDynamic(
+    comptime R: type,
+    gpa: std.mem.Allocator,
+    prev: worldmod.World(R),
+    in: Input,
+    systems: []const Sys(R),
+    exec: []const u16,
+    rec: ?*recorder.Recorder,
+) std.mem.Allocator.Error!worldmod.World(R) {
+    var w = try prev.clone(gpa);
+    errdefer w.deinit(gpa);
+    w.tick +%= 1;
+    const cmds = try input.canonicalize(gpa, in.commands);
+    defer gpa.free(cmds);
+    for (cmds) |c| {
+        if (mutation.commandToMutation(R, c)) |m| try mutation.apply(R, &w, gpa, m);
+    }
+    try runScheduledDynamic(R, &w, gpa, systems, exec, rec);
+    return w;
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------------
@@ -373,6 +452,29 @@ test "deferred despawn racing a deferred add to the same entity is deterministic
     defer b.deinit(gpa);
     try testing.expectEqual((try a.digest(gpa)).hash, (try b.digest(gpa)).hash); // deterministic
     try testing.expect(!a.isLive(.{ .index = 0, .generation = 0 })); // entity 0 despawned
+}
+
+test "stepDynamic over a RUNTIME systems slice matches stepExec over the comptime set, tick for tick" {
+    const gpa = testing.allocator;
+    const exec_ct = comptime &schedule.Schedule(Reg, &move_and_jitter).exec_order;
+    const exec_rt = try schedule.execOrderDynamic(Reg, gpa, &move_and_jitter);
+    defer gpa.free(exec_rt);
+    try testing.expectEqualSlices(u16, exec_ct, exec_rt);
+
+    var a = try seedWorld(gpa, 3);
+    defer a.deinit(gpa);
+    var b = try seedWorld(gpa, 3);
+    defer b.deinit(gpa);
+    var t: u64 = 0;
+    while (t < 6) : (t += 1) {
+        const na = try stepExec(Reg, gpa, a, .{ .tick = t + 1, .commands = &.{} }, &move_and_jitter, exec_ct, null);
+        a.deinit(gpa);
+        a = na;
+        const nb = try stepDynamic(Reg, gpa, b, .{ .tick = t + 1, .commands = &.{} }, &move_and_jitter, exec_rt, null);
+        b.deinit(gpa);
+        b = nb;
+        try testing.expectEqual((try a.digest(gpa)).hash, (try b.digest(gpa)).hash); // runtime path is faithful
+    }
 }
 
 test "empty systems list: schedule is empty and the input path still runs" {

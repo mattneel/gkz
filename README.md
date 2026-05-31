@@ -10,12 +10,13 @@ Elm/Redux (state-as-value, time-travel), and `rr` (record-replay) — not the ma
 The primary user is an **AI** — authoring game logic and debugging running games. Every design choice
 is justified by one of those two jobs.
 
-> **Status:** Phases 1–7 are complete and verified — the foundation (the World as a value + pure
+> **Status:** Phases 1–8 are complete and verified — the foundation (the World as a value + pure
 > `step`), the deterministic scheduler (§4), events & causality (§5), the **VOPR** deterministic
 > simulator/defect-finder (§9), the **relational query surface** (§7), **specs/invariants/temporal
-> properties** (§8), and **agent harnesses & evaluation** (§10). The kernel runs headless, end-to-end,
-> with zero art, bit-identically across Debug/ReleaseSafe/ReleaseFast. See [`PLAN.md`](./PLAN.md) for the
-> full roadmap and [`SPEC.md`](./SPEC.md) for the design contract.
+> properties** (§8), **agent harnesses & evaluation** (§10), and **hot-reload & schema migration** (§12):
+> real `dlopen` native-system loading + version-tagged `World→World` migrations. The kernel runs headless,
+> end-to-end, with zero art, bit-identically across Debug/ReleaseSafe/ReleaseFast. See [`PLAN.md`](./PLAN.md)
+> for the full roadmap and [`SPEC.md`](./SPEC.md) for the design contract.
 
 ---
 
@@ -52,7 +53,7 @@ zig build run      # build and run the CLI
 zig build          # build the CLI to zig-out/bin/gkz
 ```
 
-`zig build test` is the determinism gate: it runs **822 tests in all three optimize modes** and pins a
+`zig build test` is the determinism gate: it runs **837 tests in all three optimize modes** and pins a
 suite of digests — an end-to-end content hash, a per-tick hash-stream digest, an event-log digest, the
 VOPR's frozen replay constants, the eight query-result digests, the violation/spec/metric digests, and a
 frozen v1 migration image + migrated-World digests + reload-stream digest — asserted identically in every
@@ -184,7 +185,8 @@ captured per run to revisit).
 | `migrate/image.zig` | the schema-agnostic record substrate: `decode` lifts ANY serialize image into per-row `(entity, mask, [{kind_id, raw bytes}])` records using only the image's own per-Kind fingerprint (which carries each kind's byte width) — no old `Registry` types; `encode(R_target)` re-emits bytes byte-identical to `writeWorld` |
 | `migrate/fingerprint.zig` · `migrate/ops.zig` | fingerprint extract/compare/`diff`/`requireMatch`; the declared `Op` vocabulary (`drop`/`add`/`rename`/`transform`) + `FieldBuilder`/`FieldReader` leaf codecs |
 | `migrate/migrate.zig` | `validateMigration` (ops must exactly cover the fingerprint delta), `apply` (folds ops, recomputes masks, asserts the target fingerprint), `Chain`, and `migrateBytes`/`migrateWorld`/`migrateSnapshot` |
-| `reload.zig` | hot-reload as a comptime system-set swap: `SystemSet`/`reloadAt` (a World no-op), `SystemSource` (`inProcessSource` built; `NativeLibSource` a typed stub) |
+| `reload.zig` · `reload_example/*` | hot-reload via `SystemSet`/`reloadAt` (a World no-op) + a **real `std.DynLib` loader** (`NativeLibSource` opens a `.so`, resolves `gkz_systems`, hands back its `[]const Sys(R)`); two example systems compiled to actual shared objects by `build.zig` |
+| `step.zig` · `schedule.zig` (runtime path) | `stepDynamic`/`runScheduledDynamic` + `execOrderDynamic` — the runtime-systems twins that run `dlopen`'d fn-pointers, gated bit-identical to the comptime path |
 
 A migration **never instantiates the old registry** — it decodes a serialized World into a schema-agnostic
 record `Image`, applies a list of **declared, validated ops** (add a field with a default, drop a kind,
@@ -193,10 +195,13 @@ canonical-LE slices move; the result is byte-identical to what `writeWorld` woul
 out). `validateMigration` proves the ops *exactly* reconcile the per-Kind fingerprint delta **before any byte
 moves**; `apply` asserts the produced schema equals the declared target. The gate freezes a real v1 image and
 proves migrated-v1 **== natively-built v2**, chain v1→v2→v3 **== direct v1→v3 == native v3**, and purity —
-all pinned across the three optimize modes. **Hot-reload** reduces to running a *different* `comptime systems`
-slice over the same World at a tick boundary (the World owns no function pointers, so this adds **zero**
-step-path code): a reload-to-the-same set is a bit-identical hash stream, and a divergent reload is caught by
-the VOPR's divergence oracle — the kernel can't prove opaque reloaded code deterministic (§15 trusts the
+all pinned across the three optimize modes. **Hot-reload** loads simulation systems from a compiled shared
+object at runtime: `build.zig` compiles example systems into real `.so`s, `NativeLibSource` `dlopen`s one
+(via `std.DynLib`), and a runtime-systems path (`stepDynamic`) runs its fn-pointers over the same World —
+the comptime path is untouched, so the determinism gate is unchanged. The gate is genuinely honest: a
+loaded `.so`'s per-tick stream must equal the in-tree reference logic's stream (tampering the `.so` makes
+it fail), and hot-swapping to a *different* `.so` mid-stream diverges at exactly the swap tick, caught by
+the VOPR's divergence oracle. The kernel can't *prove* opaque reloaded code deterministic (§15 trusts the
 author), but it **detects** a bad reload.
 
 ### Determinism contract (the spine)
@@ -220,8 +225,8 @@ contract:
 - **Phase 5** — Introspection & relational query surface (§7) ✅
 - **Phase 6** — Specifications, invariants & properties (§8) ✅
 - **Phase 7** — Agent harnesses & evaluation (§10) ✅
-- **Phase 8** — Hot-reload & schema migration (§12): comptime system-set swap, version-tagged `World→World` migrations ✅
-- **Phase 9+** — Process model & control plane (§13): supervisor pool, the query server, cross-process sweep sharding ← *next* (the real `dlopen` native-systems loader + a watch-driven reload trigger plug into Phase 8's `SystemSource` seam here)
+- **Phase 8** — Hot-reload & schema migration (§12): real `dlopen` native-systems loading + version-tagged `World→World` migrations ✅
+- **Phase 9+** — Process model & control plane (§13): supervisor pool, the query server, cross-process sweep sharding ← *next* (a watch-driven / control-plane reload **trigger** plugs into Phase 8's `SystemSource` seam here; the loader mechanism is already built)
 - **Phase 2b** — real thread-pool execution (the scheduler architecture already makes it safe)
 
 See [`PLAN.md`](./PLAN.md) §6 for the full phase map.

@@ -405,9 +405,14 @@ test "(f) OOM-injection over the migration + reload cycle is leak/double-free fr
     try testing.checkAllAllocationFailures(testing.allocator, oomCycle, .{});
 }
 
-test "DUMP pinned artifacts" {
-    if (true) return error.SkipZigTest; // flip to false to recompute the pins
-    const gpa = testing.allocator;
+// NOT a test — a dev utility that prints the frozen pins after an intentional change. The pins it would
+// print are already VERIFIED by the gate tests above (which assert against them), so this is only used to
+// regenerate the constants. To recompute: `comptime { _ = &dumpPins; }` keeps it compiled (so it can't
+// bit-rot); call it from a scratch test (`test { try dumpPins(std.testing.allocator); }`) and read stderr.
+comptime {
+    _ = &dumpPins;
+}
+fn dumpPins(gpa: Allocator) !void {
     var v1 = try buildV1Bytes(gpa);
     defer v1.deinit(gpa);
     std.debug.print("\nPINNED_V1 ({d} bytes):\n", .{v1.items.len});

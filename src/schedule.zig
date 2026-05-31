@@ -100,6 +100,54 @@ pub fn Schedule(comptime R: type, comptime systems: []const Sys(R)) type {
     };
 }
 
+/// Runtime twins of `computeStageOf`/`computeExecOrder` for a system set whose membership is only known
+/// at RUNTIME — a hot-reloaded (dlopen'd) `[]const Sys(R)` cannot drive the comptime `Schedule`. The
+/// derivation is byte-for-byte the same greedy first-fit + stable stage sort, so for any set that COULD
+/// be expressed at comptime, `execOrderDynamic` returns the identical permutation as `Schedule.exec_order`
+/// (asserted in the gate). Determinism is preserved: the schedule is a pure function of the conflict
+/// matrix and registration order, never of runtime timing (§4).
+pub fn stagesDynamic(comptime R: type, gpa: std.mem.Allocator, systems: []const Sys(R)) std.mem.Allocator.Error![]usize {
+    const so = try gpa.alloc(usize, systems.len);
+    errdefer gpa.free(so);
+    for (0..systems.len) |i| {
+        var st: usize = 0;
+        outer: while (true) : (st += 1) {
+            for (0..i) |j| {
+                if (so[j] == st and conflict(R, systems[i].access, systems[j].access)) continue :outer;
+            }
+            break;
+        }
+        so[i] = st;
+    }
+    return so;
+}
+
+/// The flat, stage-grouped, ascending-within-stage execution order for a runtime system set. Caller owns
+/// the returned slice. Uses a STABLE insertion sort over ids initialized ascending — so ties within a
+/// stage keep ascending system id, identical to the comptime `computeExecOrder`. System ids are `u16`
+/// (matching the comptime `exec_order`), so a hot-reloaded set larger than 65535 systems is rejected in
+/// ALL build modes (`error.TooManySystems`) rather than wrapping silently in ReleaseFast — a D2 hazard the
+/// comptime path can't hit (an out-of-range comptime `@intCast` is a compile error). The unmanaged
+/// `@intCast(i)` below is then provably in range.
+pub fn execOrderDynamic(comptime R: type, gpa: std.mem.Allocator, systems: []const Sys(R)) (std.mem.Allocator.Error || error{TooManySystems})![]u16 {
+    if (systems.len > std.math.maxInt(u16)) return error.TooManySystems;
+    const stage_of = try stagesDynamic(R, gpa, systems);
+    defer gpa.free(stage_of);
+    const ids = try gpa.alloc(u16, systems.len);
+    errdefer gpa.free(ids);
+    for (0..systems.len) |i| ids[i] = @intCast(i);
+    var i: usize = 1;
+    while (i < systems.len) : (i += 1) {
+        var j = i;
+        while (j > 0 and stage_of[ids[j - 1]] > stage_of[ids[j]]) : (j -= 1) {
+            const tmp = ids[j - 1];
+            ids[j - 1] = ids[j];
+            ids[j] = tmp;
+        }
+    }
+    return ids;
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------------
@@ -200,5 +248,18 @@ test "invariant: no two systems sharing a stage conflict (the parallel-safety wi
                 try testing.expect(!conflict(Reg, systems_inv[a].access, systems_inv[b].access));
             }
         }
+    }
+}
+
+test "runtime exec order equals the comptime Schedule.exec_order (the hot-reload schedule twin is faithful)" {
+    const gpa = testing.allocator;
+    inline for (.{ &systems_stage, &systems_inv }) |sys| {
+        const stages = try stagesDynamic(Reg, gpa, sys);
+        defer gpa.free(stages);
+        const exec = try execOrderDynamic(Reg, gpa, sys);
+        defer gpa.free(exec);
+        const Sched = Schedule(Reg, sys);
+        try testing.expectEqualSlices(usize, &Sched.stage_of, stages);
+        try testing.expectEqualSlices(u16, &Sched.exec_order, exec);
     }
 }

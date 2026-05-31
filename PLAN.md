@@ -746,3 +746,57 @@ feature, coupling Phase 8 to Phase 5's gate. Migrations are already inspectable 
 target_fingerprint}`); the adapter plugs in later behind the existing `RelId`/`CATALOG` seam.
 
 Gate: **822 tests green across Debug/ReleaseSafe/ReleaseFast** (274/mode + the skipped pin-recompute dump).
+
+### Phase 8 addendum — REAL dlopen native systems (delivering the named §12 deliverable, not a stub)
+
+The first Phase-8 pass shipped migration in full but reduced "hot-reload" to a comptime system-set swap and
+left `NativeLibSource` an `error.NotImplemented` stub — a punt on the roadmap's named "`dlopen` native
+systems." This addendum delivers the real thing, validated by a design judge-panel and an adversarial review.
+
+**The architecture problem & resolution.** `step`/`Schedule` take `comptime systems` (the only comptime
+dependency is the fixed-size `[systems.len]CommandBuffer` stack array). A `dlopen`'d `.so` yields RUNTIME
+fn-pointers. So the kernel grew a runtime-systems path COEXISTING with the comptime one (zero change to the
+comptime path or its gate): `schedule.stagesDynamic`/`execOrderDynamic` (runtime twins of the comptime
+stage/exec derivation — gated to produce the IDENTICAL permutation) and `step.runScheduledDynamic`/
+`stepDynamic` (heap-allocate the command-buffer array; gated bit-identical to `stepExec` over a comptime
+set). `Sys(R)` was already a runtime struct (fn-ptr + access mask), so it crosses the boundary unchanged.
+
+**The loader & ABI.** `reload.Descriptor(R) = extern struct { count: usize, systems: [*]const Sys(R) }`,
+handed across by pointer via `export fn gkz_systems() callconv(.c) *const Descriptor`. By-POINTER (not
+by-value, not raw-fnptr-rebuild) because the host can't re-derive a system's access mask at runtime (it's
+reflected off the comptime `Query` type) — the `.so` already holds the fully-built `Sys` with the correct
+mask + thunk, and by-pointer keeps the descriptor `.so`-resident (lifetime = `[load .. unload)`).
+`NativeLibSource(R)` is a real `std.DynLib` loader (`open` → `lookup(GetFn, "gkz_systems")` →
+`desc.systems[0..count]`); `unload` closes. Soundness rests on host and `.so` sharing the IDENTICAL `gkz`
+module + registry `R` (`reload_example/shared.zig` is the single `R` for both sides) so `Sys/Table/SimCtx/
+World` layouts match (mode-independent for a fixed target). Caller contract (can't be enforced across the
+opaque boundary, §15): finish every `stepDynamic` over a set BEFORE `unload`, swap only at a tick boundary.
+
+**Two real bring-up bugs (both load-bearing, neither in any proposal):** (1) a libc-linked Zig dynamic lib
+defaults to **static-PIE** — its statically-linked-libc TLS segment is never wired into the host thread
+descriptor, so the first TLS access inside the `.so` (a ReleaseSafe stack-guard at `q.next()`) faults at
+`0x0`, while the outer descriptor relocates fine so it *looks* loaded. Fix: `lib.pie = false` → a normal
+`DT_NEEDED libc.so.6` dynamic ELF the OS loader relocates + shares host TLS (`link_libc` is necessary but
+NOT sufficient). (2) A host-mode × `.so`-mode ABI-call mismatch SEGV'd ReleaseSafe/Fast when the `.so` was
+built once in Debug. Fix: build the `.so`s PER MODE (host-mode == `.so`-mode) — which also STRENGTHENS the
+gate (each mode dlopens a `.so` compiled in its own mode, re-proving cross-mode determinism of the native
+internals, not just detecting it).
+
+**build.zig.** Per mode: two `addLibrary(.{.linkage=.dynamic, .link_libc=true})` + `lib.pie=false`, paths
+injected into the gate via `b.addOptions().addOptionPath(getEmittedBin())` (auto build-graph dependency), and
+`reload_gate.zig` run as a SEPARATE per-mode test artifact (so the base 275-test suite takes no dependency on
+the example `.so` paths).
+
+**The honesty gate (`reload_gate.zig`, empirically verified non-rubber-stamp).** (g) the dlopen'd `.so`'s
+per-tick stream `expectEqualSlices` the in-tree reference logic's stream + a pinned `REF_STREAM_DIGEST`
+across all 3 modes — **proven honest**: tampering `lib_move.zig` to `x += dx + 1` makes (g) fail at exactly
+that assertion (the `.so` rebuilds on source change; no stale-cache false-pass). (h) hot-swapping to a
+DIFFERENT `.so` (move → move-2x) diverges at EXACTLY the swap tick, caught by the divergence primitive, with
+an identical pre-swap prefix — a single in-process substitute cannot satisfy both (g) and (h). (i)
+reload-to-same `.so` twice is bit-identical and `dlopen`/`close` is host-leak-free. **Deferred behind the
+`SystemSource` seam:** a `gkz_abi_version` negotiation symbol, the file-watcher/control-plane reload TRIGGER
+(Phase 9), recompile-from-edited-source, Windows/macOS validation (wiring is portable via `getEmittedBin`),
+and reload across a CHANGED registry (that crosses into the migration layer). A seccomp/hermetic runner that
+forbids `dlopen` fails the reload-gate honestly (the base suite is a separate, unaffected artifact).
+
+Gate: **837 tests green** (275 base + 4 reload-gate per Debug/ReleaseSafe/ReleaseFast).

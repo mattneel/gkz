@@ -133,6 +133,13 @@ pub const reload = @import("reload.zig");
 pub const SystemSet = reload.SystemSet;
 pub const SystemSource = reload.SystemSource;
 pub const reloadAt = reload.reloadAt;
+pub const NativeLibSource = reload.NativeLibSource; // real std.DynLib loader for reloadable .so systems
+
+// the runtime-systems path (drives dlopen'd or otherwise runtime-known system sets; the comptime
+// `step`/`Schedule` twins)
+pub const stepDynamic = step_mod.stepDynamic;
+pub const runScheduledDynamic = step_mod.runScheduledDynamic;
+pub const execOrderDynamic = schedule.execOrderDynamic;
 
 /// Bring-up placeholder so the scaffold `main.zig` keeps compiling during Phase 1. Replaced by a real
 /// kernel demo once `step`/`snapshot`/`replay` land.

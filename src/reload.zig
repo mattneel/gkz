@@ -13,11 +13,15 @@
 //! into a `Defect` (`oracle.firstDivergentTick`). The kernel cannot prove opaque reloaded code
 //! deterministic (§15 trusts the author); what it CAN do — and does — is DETECT a divergent reload.
 //!
-//! `SystemSource(R)` is the seam a real loader plugs into: `inProcessSource` (built + tested) wraps a
-//! comptime set; `NativeLibSource` is a typed `error.NotImplemented` stub shaped exactly like a future
-//! `std.DynLib` impl resolving an exported `gkz_systems` symbol. The actual `dlopen`/shared-object build
-//! rule + file-watcher trigger are deferred (the swap + VOPR validation are identical regardless of what
-//! triggers the load).
+//! `SystemSource(R)` is the seam a reload trigger plugs into. `inProcessSource` wraps a comptime set;
+//! `NativeLibSource` is a REAL `std.DynLib` loader — it opens a shared object, resolves the exported
+//! `gkz_systems` symbol, and hands back the `.so`'s `[]const Sys(R)` (run via `step.runScheduledDynamic`
+//! / `stepDynamic`, the runtime-systems path). `build.zig` compiles `src/reload_example/*` into real
+//! shared objects and the determinism gate (`reload_gate.zig`) dlopens them, proving a loaded `.so`'s
+//! per-tick stream equals the in-tree reference logic and that a divergent `.so` is caught. Deferred (not
+//! the mechanism): the file-watcher / control-plane TRIGGER that decides *when* to reload, and a recompile
+//! step that rebuilds the `.so` from edited source (the swap + VOPR validation are identical regardless of
+//! what triggers the load — Phase 9).
 
 const std = @import("std");
 const schedule = @import("schedule.zig");
@@ -69,18 +73,57 @@ pub fn inProcessSource(comptime R: type, comptime systems: []const Sys(R)) Syste
     return .{ .ctx = &in_process_ctx, .loadFn = Impl.load, .unloadFn = Impl.unload };
 }
 
-/// A typed stub for a future native shared-object loader. Shaped exactly like a real `std.DynLib` impl
-/// (open `path`, resolve an exported `gkz_systems` symbol, wrap it as a `SystemSet`); only the body is
-/// unimplemented. `source().load()` returns `error.NotImplemented`.
+// --- the native shared-object loader (real dlopen, §12) -------------------------------------------
+
+/// The exported symbol a reloadable shared object must define (`export fn gkz_systems() callconv(.c)
+/// *const Descriptor(R)`). The host resolves it with `std.DynLib.lookup`.
+pub const SYSTEMS_SYMBOL: [:0]const u8 = "gkz_systems";
+
+/// The ABI a shared object hands back across the dlopen boundary: a count + a many-pointer to its static
+/// `[]const Sys(R)`. The host and the `.so` are compiled by the SAME Zig for the SAME target and share the
+/// `gkz` module and registry `R`, so `Sys(R)`'s layout matches on both sides and the host can read
+/// `systems[0..count]` directly. Both the `Sys` fn-pointers (.so code segment) and their `name` slices
+/// (.so rodata) are valid ONLY while the library is open — a `SystemSet` obtained this way must not be
+/// used after `unload`.
+pub fn Descriptor(comptime R: type) type {
+    return extern struct { count: usize, systems: [*]const Sys(R) };
+}
+
+/// The native loader: `std.DynLib.open(path)`, resolve `gkz_systems`, and wrap the returned descriptor's
+/// systems as a `SystemSet`. `unload` closes the library (after which the set's pointers are dangling —
+/// the caller must have finished running/snapshotting first). `load`/`unload` MUST pair: calling `load`
+/// twice without an intervening `unload` is `error.AlreadyLoaded` (it would orphan the first handle).
+/// `load` can also fail with `error.SymbolNotFound` (the `.so` lacks a `gkz_systems` export) or a
+/// `std.DynLib` open error; note the libc (`DlDynLib`) backend the gate uses collapses missing-file /
+/// bad-ELF / unresolved-dependency into one open error rather than distinguishing them. On ANY failure
+/// after the open, the just-opened library is closed (no leak) and `lib` is left null.
 pub fn NativeLibSource(comptime R: type) type {
     return struct {
         const Self = @This();
-        path: []const u8,
+        const GetFn = *const fn () callconv(.c) *const Descriptor(R);
 
-        fn loadImpl(_: *anyopaque) anyerror!SystemSet(R) {
-            return error.NotImplemented; // a real impl: std.DynLib.open(path) -> lookup("gkz_systems")
+        path: []const u8,
+        lib: ?std.DynLib = null,
+
+        fn loadImpl(ctx: *anyopaque) anyerror!SystemSet(R) {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (self.lib != null) return error.AlreadyLoaded; // load/unload must pair — refuse to orphan a handle
+            self.lib = try std.DynLib.open(self.path);
+            errdefer { // any failure after the open closes the library rather than leaking it
+                self.lib.?.close();
+                self.lib = null;
+            }
+            const get = self.lib.?.lookup(GetFn, SYSTEMS_SYMBOL) orelse return error.SymbolNotFound;
+            const desc = get();
+            return .{ .systems = desc.systems[0..desc.count] };
         }
-        fn unloadImpl(_: *anyopaque) void {}
+        fn unloadImpl(ctx: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (self.lib) |*l| {
+                l.close();
+                self.lib = null;
+            }
+        }
 
         pub fn source(self: *Self) SystemSource(R) {
             return .{ .ctx = self, .loadFn = loadImpl, .unloadFn = unloadImpl };
@@ -168,10 +211,13 @@ test "inProcessSource returns the comptime set; its stream matches the raw compt
     try testing.expectEqual(TICKS, cap.hashes.len);
 }
 
-test "NativeLibSource.load returns error.NotImplemented (the typed seam)" {
-    var nls = NativeLibSource(Reg){ .path = "libgkz_systems.so" };
+test "NativeLibSource.load really opens a library: a missing path is a clean FileNotFound" {
+    // The loader genuinely calls std.DynLib.open (no stub) — a nonexistent .so fails with the real
+    // filesystem error, not a placeholder. (A successful end-to-end dlopen of real .so's built by
+    // build.zig is proven in reload_gate.zig, which has the injected library paths.)
+    var nls = NativeLibSource(Reg){ .path = "this-library-does-not-exist-9b1c.so" };
     const src = nls.source();
-    try testing.expectError(error.NotImplemented, src.load());
+    try testing.expectError(error.FileNotFound, src.load());
 }
 
 test "reload-to-SAME mid-stream is bit-identical to a continuous run (streamDigest equal)" {
