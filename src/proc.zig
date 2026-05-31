@@ -23,6 +23,8 @@ const worker_mod = @import("proc/worker.zig");
 pub const runWorker = worker_mod.runWorker;
 pub const POISON_CRASH = worker_mod.POISON_CRASH;
 pub const POISON_HANG = worker_mod.POISON_HANG;
+pub const POISON_SLEEP = worker_mod.POISON_SLEEP;
+pub const POISON_SLEEP_MS = worker_mod.POISON_SLEEP_MS;
 
 pub const supervisor = @import("proc/supervisor.zig");
 pub const Supervisor = supervisor.Supervisor;

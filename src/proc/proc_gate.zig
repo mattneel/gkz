@@ -9,8 +9,10 @@
 //!   (c) a deliberately CRASHING worker (SIGABRT) is harvested as a Defect with the dispatched job as the
 //!       repro — the parent survives and the other shards merge correctly; a HANGING worker hits the
 //!       timeout and is killed+reaped (not a hang).
-//!   (d) the query server multiplexes respond() byte-identically, and the Unix-domain socket transport
-//!       binds+connects on this host.
+//!   (d) the query server multiplexes respond() byte-identically over a REAL Unix-domain socket round-trip.
+//!   (e) fork execution: in-process == subprocess final snapshot + stream digest (pinned).
+//!   (f) parallel dispatch genuinely OVERLAPS — N sleep-workers run concurrently (parallel wall-clock well
+//!       under sequential), proving real cross-process concurrency, not a serialized "parallel" path.
 //!
 //! HONESTY (the Phase-8 lesson, structural): a disguised in-process gate cannot pass (c) — an in-process
 //! @panic aborts the GATE's own test binary; a real `Term.signal` requires a real child that died and was
@@ -315,6 +317,53 @@ test "(e) fork execution: in-process == subprocess final snapshot + stream diges
         .ok => {},
     }
     try testing.expectEqualSlices(u8, inproc.items, sub.items); // cross-process fork determinism, bit for bit
+}
+
+test "(f) parallel dispatch genuinely OVERLAPS workers (concurrent wall-clock, not serialized)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const jd = try jobDir(gpa, &tmp);
+    defer gpa.free(jd);
+
+    const N = 4;
+    // N sleep-workers: each sleeps ~POISON_SLEEP_MS, then computes its (normal) aggregate.
+    var built: [N]std.ArrayList(u8) = undefined;
+    var nbuilt: usize = 0;
+    defer for (built[0..nbuilt]) |*b| b.deinit(gpa);
+    var jobs: [N]proc.Supervisor(u64).ShardJob = undefined;
+    for (0..N) |i| {
+        built[i] = try buildJob(gpa, @intCast(i), @intCast(i + 1), proc.POISON_SLEEP);
+        nbuilt += 1;
+        jobs[i] = .{ .shard_i = @intCast(i), .range = .{ .lo = @intCast(i), .hi = @intCast(i + 1) }, .bytes = built[i].items };
+    }
+    var ctx = proc.SubprocCtx{ .exe_path = build_opts.worker_exe_path, .job_dir = jd, .io = io, .timeout_ms = 30000 };
+
+    // PARALLEL dispatch (Io.Group across N worker processes)
+    var par = proc.Supervisor(u64){ .gpa = gpa, .executor = proc.subprocessExecutor(&ctx), .io = io, .n_workers = N };
+    const p0 = std.Io.Clock.now(.awake, io);
+    var rp = try par.runJobs(&jobs);
+    const p1 = std.Io.Clock.now(.awake, io);
+    defer rp.deinit(gpa);
+    if (rp.spawn_denied) return error.SkipZigTest;
+    const par_ms = @divTrunc(p1.nanoseconds - p0.nanoseconds, std.time.ns_per_ms);
+
+    // SEQUENTIAL dispatch (same jobs, io=null → one at a time)
+    var seqv = proc.Supervisor(u64){ .gpa = gpa, .executor = proc.subprocessExecutor(&ctx), .n_workers = 1 };
+    const s0 = std.Io.Clock.now(.awake, io);
+    var rs = try seqv.runJobs(&jobs);
+    const s1 = std.Io.Clock.now(.awake, io);
+    defer rs.deinit(gpa);
+    const seq_ms = @divTrunc(s1.nanoseconds - s0.nanoseconds, std.time.ns_per_ms);
+
+    // determinism: identical merged result regardless of dispatch.
+    try testing.expectEqual(rs.agg.sum, rp.agg.sum);
+    try testing.expectEqual(rs.agg.count, rp.agg.count);
+    // OVERLAP: N workers each sleep ~the same time, so parallel ≈ 1 sleep + spawn overhead while sequential
+    // ≈ N sleeps. Assert parallel < 60% of sequential — a huge margin (sleep isn't CPU-bound, so this holds
+    // on ANY core count); it fails only if the dispatch actually serializes the spawns.
+    try testing.expect(par_ms * 100 < seq_ms * 60);
 }
 
 // NOT a test — recompute the pins after an intentional change (each is verified by a test above).

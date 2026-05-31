@@ -18,6 +18,11 @@ const executor = @import("executor.zig");
 pub const POISON_CRASH: u16 = 0xFFFF;
 /// …this value makes the worker hang forever (gate hang/timeout sub-gate).
 pub const POISON_HANG: u16 = 0xFFFE;
+/// …this value makes the worker sleep ~150ms before computing (then return a NORMAL result) — the gate's
+/// concurrency sub-gate uses it to prove parallel dispatch genuinely OVERLAPS workers (N sleeps finish in
+/// ~1 sleep when concurrent, ~N sleeps when serialized).
+pub const POISON_SLEEP: u16 = 0xFFFD;
+pub const POISON_SLEEP_MS: u64 = 150;
 
 const JOB_CAP: usize = 64 * 1024 * 1024; // bound the job-file read (the job comes from our own supervisor)
 
@@ -41,6 +46,10 @@ pub fn runWorker(comptime Spec: type, init: std.process.Init) !void {
                 if (s.oracle_set_id == POISON_CRASH) std.process.abort(); // SIGABRT — a real crash to harvest
                 if (s.oracle_set_id == POISON_HANG) {
                     while (true) {} // the parent's timeout-kill path must reap us
+                }
+                if (s.oracle_set_id == POISON_SLEEP) {
+                    const dur = std.Io.Clock.Duration{ .clock = .awake, .raw = std.Io.Duration.fromMilliseconds(POISON_SLEEP_MS) };
+                    dur.sleep(io) catch {}; // then fall through to compute the NORMAL result
                 }
             },
             else => {},

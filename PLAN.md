@@ -933,3 +933,19 @@ TCP would be a faithful proxy). §13's concrete bullets — one-process-per-sim,
 server over a socket, across-cores throughput — are all met and gated.
 
 Gate: **897 tests green** (290 base + 4 reload-gate + 5 proc-gate per Debug/ReleaseSafe/ReleaseFast).
+
+### Phase 9 — proving the parallelism is REAL (not a serialized "parallel" path)
+
+A sharp review question: are the subprocesses *actually* parallel, or did the gate just assert
+parallel-result == sequential-result (which a sequential impl passes too)? The latter — so the "parallel"
+claim was unproven. Closed it: gate (f) dispatches N=4 worker processes that each sleep ~150ms then compute,
+and measures wall-clock for PARALLEL (`Io.Group`, `n_workers=N`) vs SEQUENTIAL (`n_workers=1`) dispatch over
+the SAME jobs. Measured (32-core host): parallel ≈ 160ms, sequential ≈ 640ms — a ~4× speedup, i.e. genuine
+overlap. The gate asserts `parallel < sequential × 0.6` (a ~2× margin); because the workers SLEEP (not
+CPU-bound), this proves the DISPATCH overlaps the spawns regardless of core count, and fails only if the
+dispatch actually serializes. Empirically confirmed first via a standalone probe (4 × `sleep 0.25` in 282ms,
+not 1000ms). So separate OS processes are the real (and, for a no-shared-mutable-state determinism kernel,
+the principled) parallelism — and the overlap is now gated, not assumed. (`std.debug.print` corrupts the
+`--listen` test-runner protocol — the timing is asserted, not printed, in the gate.)
+
+Gate: **900 tests green** (290 base + 4 reload-gate + 6 proc-gate per Debug/ReleaseSafe/ReleaseFast).

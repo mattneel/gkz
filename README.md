@@ -54,7 +54,7 @@ zig build run      # build and run the CLI
 zig build          # build the CLI to zig-out/bin/gkz
 ```
 
-`zig build test` is the determinism gate: it runs **897 tests in all three optimize modes** and pins a
+`zig build test` is the determinism gate: it runs **900 tests in all three optimize modes** and pins a
 suite of digests — an end-to-end content hash, a per-tick hash-stream digest, an event-log digest, the
 VOPR's frozen replay constants, the eight query-result digests, the violation/spec/metric digests, and a
 frozen v1 migration image + migrated-World digests + reload-stream digest — asserted identically in every
