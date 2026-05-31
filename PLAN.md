@@ -949,3 +949,236 @@ the principled) parallelism — and the overlap is now gated, not assumed. (`std
 `--listen` test-runner protocol — the timing is asserted, not printed, in the gate.)
 
 Gate: **900 tests green** (290 base + 4 reload-gate + 6 proc-gate per Debug/ReleaseSafe/ReleaseFast).
+
+## 13. Phase 2b design — real in-process multithreaded scheduler execution (decision of record, from the design judge-panel)
+
+4-architect / 4-lens judge panel + synthesis. **Base = `determinism-purist`** (Judge#3's pick; tied-best determinism rigor and the only design honest about the arena/gpa boundary) **grafted with `throughput-first`'s eager-inline-degrade defusal** (Judge#1 and Judge#2's decisive separator). Phase 9 shipped cross-*process* parallelism; this is different — **threads inside one process** running a stage's conflict-free systems against shared sim state, with the per-tick hash stream and (recording-on) event log staying **bit-/byte-identical** to the single-threaded spine. The spine (`step.zig`) is the canonical referent and is barely touched; the threaded twin lives in a new file.
+
+### 13.1 Concurrency model, API, files touched
+
+**New file `src/step_par.zig`** (additive; mirrors the Phase-8 `reload.zig` / Phase-9 `proc/` "twin in its own file" precedent). The **only** edit to `step.zig` is a behavior-preserving extraction of the drain (see §13.3) so the `(system_id, seq)` comparator can never drift between the serial and parallel paths.
+
+**New public API** (full Zig signatures):
+
+```zig
+// src/step_par.zig
+pub const ParError = std.mem.Allocator.Error; // no new error set; Group task faults captured via slots
+
+/// Parallel twin of step.runScheduled. Runs each stage's systems across an Io.Group, barrier
+/// (group.await) between stages, then the SAME end-of-tick (system_id,seq) drain. Bit-identical
+/// per-tick result + (rec!=null) byte-identical merged log vs runScheduled.
+/// io==null OR n_threads<=1 OR systems.len<2-stages  ==>  delegates VERBATIM to step.runScheduled
+/// (caller gpa, NO arenas) — so the bit-identity gate's referent is the literal proven serial code.
+/// CONSTRAINT (n_threads>1): `gpa` must be thread-safe for the rare arena page-refill (§13.4).
+pub fn runScheduledPar(
+    comptime R: type, w: *world.World(R), gpa: std.mem.Allocator,
+    comptime systems: []const schedule.Sys(R), exec: []const u16,
+    rec: ?*recorder.Recorder, io: ?std.Io, n_threads: usize,
+) ParError!void
+
+/// stepExec's parallel twin: the full (clone, tick+%1, input-command prologue, parallel run, drain).
+/// Prologue is single-threaded (runs before any stage); only the system run is parallel. `exec` may be
+/// a stage-respecting within-stage permutation (the order-permutation property holds under threads).
+pub fn stepExecPar(
+    comptime R: type, gpa: std.mem.Allocator, prev: world.World(R), in: input.Input,
+    comptime systems: []const schedule.Sys(R), exec: []const u16,
+    rec: ?*recorder.Recorder, io: ?std.Io, n_threads: usize,
+) ParError!world.World(R)
+
+/// Convenience: stepExecPar with the canonical Schedule.exec_order (the production threaded entry,
+/// the parallel twin of step.stepRec).
+pub fn stepPar(
+    comptime R: type, gpa: std.mem.Allocator, prev: world.World(R), in: input.Input,
+    comptime systems: []const schedule.Sys(R),
+    rec: ?*recorder.Recorder, io: ?std.Io, n_threads: usize,
+) ParError!world.World(R)
+
+/// The exec_order-driven merge of per-system sub-logs into a destination log (§13.3). Public so the
+/// gate can drive it directly.
+pub fn mergeSubLogs(
+    gpa: std.mem.Allocator, dst: *event_log.EventLog,
+    subs: []const recorder.Recorder, exec: []const u16,
+) ParError!void
+```
+
+**File-private helpers in `step_par.zig`:** `runOne` (the per-system task fn) and a comptime stage-slicer.
+
+**`root.zig` exports (append-only):**
+```zig
+pub const step_par = @import("step_par.zig");
+pub const runScheduledPar = step_par.runScheduledPar;
+pub const stepExecPar    = step_par.stepExecPar;
+pub const stepPar        = step_par.stepPar;
+pub const mergeSubLogs   = step_par.mergeSubLogs;
+```
+and `_ = step_par;` in the `test {}` refAllDecls block so its in-file tests run under the base 3-mode matrix.
+
+**Stage recovery (comptime).** `exec` is stage-grouped ascending (`computeExecOrder`, schedule.zig:71-84), so a stage is a *contiguous run* of equal `Schedule(R,systems).stage_of[exec[k]]`. I do **not** re-derive stages at runtime; I segment `exec` by the comptime `stage_of` label of each id (cutting whenever `stage_of[exec[k]] != stage_of[exec[k-1]]`). This is robust to a within-stage permutation — segmenting by *label*, never by position — so each stage slice is a sub-slice of the canonical `exec` with identical ids/order.
+
+**Per-stage execution (`group.await` is the barrier).** For each stage slice in stage order:
+
+```zig
+if (io == null or n_threads <= 1 or slice.len == 1) {
+    for (slice) |sid| runOne(...);                 // inline (also the io==null / size-1-stage path)
+} else {
+    var group: std.Io.Group = .init;
+    // INLINE-LAST: spawn k-1 tasks, run the LAST sid on THIS thread (frees a pool slot, keeps a core
+    // hot, and mirrors supervisor.zig:121-124's inline+Group mix).
+    for (slice[0 .. slice.len - 1]) |sid|
+        group.async(io.?, runOne, .{ R, systems, sid, &w.table, order, w.tick, w.rng_root, &bufs[sid], &emitters[sid], &errs[sid] });
+    const last = slice[slice.len - 1];
+    runOne(R, systems, last, &w.table, order, w.tick, w.rng_root, &bufs[last], &emitters[last], &errs[last]);
+    group.await(io.?) catch {};                    // BARRIER (see memory-model note below)
+}
+// after the barrier: scan errs[*] for this stage in ascending sid; first non-null -> return it.
+```
+
+**`group.await` is a real fence, not a bare join** — confirmed against `std.Io.Threaded`: `groupAwait` uses an `.acq_rel` `fetchOr` and an `.acquire` load on the completion counter, establishing happens-before so stage *s*'s column writes are visible to stage *s+1*'s reads (and to the post-barrier drain) on a different worker thread. This is the *same* pattern `supervisor.zig:119-142` already depends on for cross-thread index-addressed slot handoff. Pin this as a one-line comment + citation in the twin so a future reader need not re-derive it.
+
+**Per-system task fn** (free-standing, captures nothing by closure — all by value or distinct-slot pointer, matching `supervisor.resolveShard`):
+
+```zig
+fn runOne(
+    comptime R: type, comptime systems: []const Sys(R), sid: u16,
+    table: *Table(R), order: []const u32, tick: u64, rng_root: RngRoot,
+    buf: *CommandBuffer(R), emitter: *EventEmitter, err: *?std.mem.Allocator.Error,
+) void {
+    var ctx = SimCtx(R){ .tick = tick, .rng_root = rng_root, .system_id = sid, .cmd = buf, .events = emitter };
+    systems[sid].invoke(&ctx, table, order) catch |e| { err.* = e; };
+}
+```
+`Group.async` coerces the fn to `Cancelable!void` and `catch {}`-drops the result, so the `Allocator.Error` **must** be captured into a per-system out-slot `errs[sid]` (exactly the `proc_gate.serveOne` / `supervisor.resolveShard` discipline) and surfaced after `await` in ascending-sid order — deterministic, never swallowed. OOM is off the determinism contract (a failed run, not a divergence). `sid` and all slot pointers are passed **by value** in the args tuple (no loop-variable-by-reference aliasing).
+
+**What each task touches:** its declared-Write columns (`table.column(i)[row]` — stage-disjoint, see §13.5 hazard #1), its Read columns (no co-running writer), the shared read-only `order: []const u32`, `tick`/`rng_root` (by value), its OWN `bufs[sid]` / `emitters[sid]` / `errs[sid]` (distinct addresses, indexed by `sid`). No task writes any shared mutable cell.
+
+**Degenerate cases** (checked in order, all collapse to the proven serial path): `io == null` OR `n_threads <= 1` → delegate **verbatim** to `step.runScheduled`/`step.stepExec` (caller gpa, no arenas — the literal serial referent the bit-identity gate compares against). `systems.len == 0` → the comptime `if (systems.len != 0)` guard (so the `[0]` arrays are never analyzed). A stage of size 1 → run inline (no Group, no spawn). Arenas are used **only on the actually-threaded branch**.
+
+### 13.2 The order-canonicalized columns and drain (single-threaded, post-barrier)
+
+`order = w.table.canonicalOrder(gpa)` is computed **once** on the orchestrator thread before any fan-out (the table is structurally frozen during the run phase — all structural change is deferred to command buffers) and shared read-only by every task. The end-of-tick drain — gather every `bufs[i].list.items` in `0..len` order, stable-sort by `(system_id, seq)`, `mutation.applyCommand` in order — runs **single-threaded after the last stage's await**, byte-identical to `runScheduled`. It is never parallel.
+
+### 13.3 Per-system sub-log merge — byte-for-byte reproduction of the single-threaded log
+
+**The hazard (verified, recorder.zig:33-89).** A single shared `Recorder` has one append-ordered `log`, shared `scratch_bytes`/`scratch_causes` (`clearRetainingCapacity` then append — a data race), and a single-slot `cur_sa` SystemCause-dedup that assumes contiguous per-`(tick,system)` `record()` calls. Concurrent `record()` races all three **and** scrambles physical log order.
+
+**The invariant that makes a deterministic merge possible (verified, simctx.zig:82-96).** `EventId = {tick, emitter=system_id, seq=emit_ordinal}` and the SystemCause id `{tick, RESERVED_SYSACT, seq=system_id}` are **pure functions of `(tick, system_id, emit_ordinal)`** — execution-order *independent*. `emit_ordinal` lives on each task's own stack `SimCtx` and advances unconditionally. So threading changes **only the physical append order**; every id is identical.
+
+**Design — per-system sub-recorders, merged in `exec` order.** When `rec != null` and we take the threaded branch, allocate `subs: [systems.len]Recorder`, `subs[sid] = Recorder.init(arenas[sid].allocator())` (§13.4). Each task's emitter is `.{ .recording = &subs[sid] }`. Each system runs in exactly one stage and is invoked exactly once per tick on one task, so:
+- its `scratch_bytes`/`scratch_causes` are private (no race);
+- its `cur_sa` dedup works **unchanged** — its records are contiguous *within its own sub-log*, which is exactly the contiguity precondition; it fires its SystemCause node exactly once on first emit (recorder.zig:70);
+- its sub-log holds exactly that system's tick-T block: `[SystemCause(tick, RESERVED_SYSACT, sid)] ++ ev0 ++ ev1 ++ …`, byte-identical to what the shared recorder produced for that system in isolation, because `record()`'s output depends only on `(E, tick, system_id, seq, subject, value, extra)` and the sub-recorder's own `cur_sa`.
+
+**The exact merge** (single-threaded, after the last stage's `await`, before the drain frees the arenas):
+
+```zig
+pub fn mergeSubLogs(gpa, dst: *EventLog, subs: []const Recorder, exec: []const u16) !void {
+    for (exec) |sid| {                                  // exec == stages in order, ascending sid within a stage
+        const src = &subs[sid].log;
+        for (src.events.items) |e| {                    // already in this system's emission order
+            const payload = src.payload_arena.items[e.payload_off..][0..e.payload_len];
+            const causes  = src.edge_arena.items[e.cause_off..][0..e.cause_len];
+            try dst.append(gpa, e.id, e.kind, e.emitter, e.subject, payload, causes);
+        }
+    }
+}
+```
+
+Slice each sub-log's `payload_arena`/`edge_arena` by the event's **own** `payload_off`/`payload_len`/`cause_off`/`cause_len` (verified field names: `payload_off:u32`, `payload_len:u16`, `cause_off:u32`, `cause_len:u32` — event.zig:77-80). This avoids the O(events²) `payloadOf(e.id)`/`causesOf(e.id)` find-by-id scan and is the canonical direct-slice merge.
+
+**Why byte-for-byte identical to single-threaded:**
+1. Single-threaded `runScheduled` appends, *per system in `exec` order*, exactly `[SystemCause, ev0, ev1, …]` (each emitting system's block starts with its lazily-materialized SystemCause node).
+2. The merge re-appends, *per system in the same `exec` order*, exactly that system's block from its sub-log.
+3. `record()`'s output for a given system is independent of any other system, so the blocks are identical.
+4. `EventLog.append` (event_log.zig:49-73) re-bases `payload_off`/`cause_off` into the **destination** arenas and copies payload/cause bytes in append order; `writeLog` (event_log.zig:129-142) serializes `events[]` then `edge_arena` then raw `payload_arena`. Since the merged `events[]` order == single-threaded order, and per-event payload/cause bytes are identical, and the arenas are filled in the same sequence, `writeLog` produces identical bytes → `logDigest` identical.
+5. **SystemCause lazy-materialization coincides exactly:** a system emitting ≥1 event materializes exactly one SystemCause node at the head of its block in BOTH paths; a system emitting nothing produces an empty sub-log (its `cur_sa` never fires) and contributes nothing — identical to single-threaded, where the spine never calls `record` for it.
+6. **Cross-tick causes** (`CauseToken`, the `Spark`←`Boom` chain, replay.zig:246-261) are recorder-independent `{tick, system_id, emit_ordinal}` — identical threaded vs single — so tokens stored in components and the edges they resolve to are preserved verbatim.
+
+**Lifecycle:** sub-recorders are per-tick scratch. Per tick: dispatch → await(barrier) → drain (reads `bufs`) → merge (copies sub-logs into the caller `rec.log` on the caller gpa) → reset/deinit arenas. The merge **copies** bytes into the caller-gpa master log before any arena reset.
+
+### 13.4 Allocator decision — per-system arenas, with a documented gpa-thread-safety constraint for refill
+
+Two concurrent allocation sites under N threads: (a) `CommandBuffer.list` growth on `cmd.spawn/add/set/…`; (b) per-system `Recorder` `log`/`scratch` growth on `record`.
+
+**Decision: per-system `ArenaAllocator` per tick** (option b), NOT "require a thread-safe gpa globally". Each system gets `arenas: [systems.len]std.heap.ArenaAllocator`, `arenas[sid] = .init(gpa)`, created on the **orchestrator thread before fan-out**. `bufs[sid] = CommandBuffer(R).init(arenas[sid].allocator(), sid)`; `subs[sid] = Recorder.init(arenas[sid].allocator())`. An arena is touched by exactly one thread (the task owning `sid`) → zero contention, no lock, no false sharing — which is what keeps the §13.6 overlap genuine (a shared thread-safe gpa would serialize every append behind its mutex, defeating the point).
+
+**The one residual all four designs share, closed two ways:**
+- **Refill:** intra-arena bumps need no gpa; an arena *page-refill* mid-task calls `gpa.alloc` from a worker thread. To remove this structurally, **pre-reserve each arena to a small high-water capacity on the orchestrator thread before fan-out** (alloc-then-`reset(.retain_capacity)`), so the common case needs no concurrent gpa hit at all.
+- **Constraint, documented in the module header:** when `n_threads > 1`, the `gpa` must be thread-safe for the rare over-the-high-water refill. `std.testing.allocator` / `DebugAllocator` satisfy it (`thread_safe` defaults true); any production thread-safe allocator does. This is the honest fallback the judges insisted on naming rather than papering over.
+
+**D8 safety (no addresses in hashed state):** arena/bump addresses never enter hashed state. `Command.payload` is an inline `[max]u8` value copy (command_buffer.zig:55); the drain copies Command *values* into `all` and applies by value. Sub-log entries store ids/values/u32 offsets, never pointers; the merge re-bases offsets into the caller gpa's arenas. `hashWorld` reads only World columns (commands and the event log are side structures, never hashed — command_buffer.zig:18, event_log.zig:1-6). So which arena an allocation lands in is invisible to every digest → Debug==ReleaseSafe==ReleaseFast preserved. The gate's ARENA-EQUIVALENCE test (T7) pins this by asserting the arena-using threaded path equals the gpa-using serial pins.
+
+### 13.5 Determinism-hazards table (hazard → eliminating mechanism, each verified against the code)
+
+| # | Hazard | Eliminating mechanism (verified) |
+|---|--------|----------------------------------|
+| 1 | **Data race on component columns** | `computeStageOf` (schedule.zig:54-67) + `conflict` (schedule.zig:20-22: `a.write & (b.read\|b.write) != 0`, symmetric) ⇒ same-stage systems are pairwise non-conflicting ⇒ each column has **at most one writer per stage** and no reader of a written column co-runs with it. `column(i)` = `rows.items(compField(i))` (storage.zig:74); `MultiArrayList.items` copies the list by value and returns a slice into a **distinct, non-overlapping** backing span (storage.zig:57-59 confirms it does not propagate constness — distinct fields are distinct slices). Concurrent writes hit disjoint addresses. The in-tree invariant test "no two systems sharing a stage conflict" (schedule.zig:243-252) already asserts the precondition. |
+| 2 | **Within-column row aliasing** | N/A — a column has ≤1 writer per stage (WAW conflicts forbid two), and that one system visits each row once via its own Query cursor. No two tasks touch the same column. |
+| 3 | **Cross-stage WAR/WAW visibility / torn reads across the barrier** | `group.await` is a happens-before fence (`.acq_rel` fetchOr + `.acquire` load in `std.Io.Threaded`, the same edge `supervisor.zig:119-142` relies on). All stage-*s* writes are published before stage-*s+1* reads or the post-barrier drain. |
+| 4 | **Command-buffer append race** | Each task writes ONLY `bufs[sid]` (distinct array element, indexed by `sid` passed by value); backing memory is a single-thread-owned arena. The gather+sort+apply drain runs single-threaded post-barrier (§13.2). Same index-addressed-slot discipline as `supervisor.zig:64-66`. |
+| 5 | **Allocator contention / UB** | Per-system arenas (one thread per arena); residual gpa hit only on over-high-water refill, for which gpa must be thread-safe (§13.4, documented; testing.allocator qualifies). Pre-reservation removes it in the common case. |
+| 6 | **Recorder scratch/`cur_sa`/log race** | Per-system sub-Recorders (own scratch, own `cur_sa`, own log). `rec.log` written only during the single-threaded merge. `cur_sa` dedup correct because each sub-recorder sees only its own contiguous records (§13.3). |
+| 7 | **Physical log-order nondeterminism** | Merge replays sub-log appends in canonical `exec` order ⇒ `rec.log.events[]` order == single-threaded ⇒ `writeLog` bytes identical ⇒ `logDigest` identical. EventIds are order-independent already (§13.3 invariant). |
+| 8 | **RNG race / shared cursor** | N/A — `rngmod.draw(rng_root, tick, entity, stream)` is pure, no cursor (D4, simctx.zig:71); `rng_root` copied by value into each `SimCtx`. Concurrent draws are pure reads. |
+| 9 | **Float / clock / syscall leak into hashed state (D7)** | None introduced — the twin adds no arithmetic; systems use fpz fixed-point. `Io.Clock.now` appears ONLY in the gate's wall-clock assertion, never in step/digest. The sleeping overlap systems are pure w.r.t. hashed state (sleep is wall-clock only, never read into World). |
+| 10 | **Pointer / address in hashed state (D8)** | None — arena addresses never enter Command payloads (inline value copies), sub-log entries (ids/values/u32 offsets), World columns, or digests. The merge re-bases offsets. Build-mode bit-identity preserved (§13.4). |
+| 11 | **`Group.async` swallows task errors** | Allocator.Error captured into `errs[sid]` out-slot, surfaced after await in ascending-sid order. OOM propagates; never a silent short/empty buffer that diverges the hash. |
+| 12 | **Loop-variable-by-reference capture** | `sid`, `table`, `order`, `tick`, `rng_root`, slot pointers all passed **by value** into the `Group.async` args tuple (matching `supervisor.resolveShard`). No task aliases a mutating loop variable. |
+| 13 | **`Io.async` EAGER-inline degrade changing RESULTS** | None — eager execution (a surplus task runs on the caller when `busy_count >= async_limit`) is just another physical intra-stage order; determinism holds for ANY intra-stage order (the §4 order-permutation property). It affects only wall-clock overlap, addressed in the gate (§13.6). |
+| 14 | **Drain comparator drift between spine and twin** | Eliminated by extracting the `(system_id, seq)` drain into a shared `step.drainAndApply(R, w, gpa, bufs)` called by BOTH `runScheduled` and the parallel twin (§13.7). |
+| 15 | **Arena use-after-reset (cross-tick lifetime)** | Strict order: dispatch → await → drain (reads bufs) → merge (copies sub-logs into caller-gpa log) → reset/deinit arenas. No premature `defer` frees an arena before both consumers run. A dedicated gate test (T8) asserts a 2nd-tick merge never reads tick-1 freed bytes. |
+| 16 | **Escape-hatch: a rogue system touching an undeclared column** | Out of contract, UNCHANGED from single-threaded (SPEC §15 trusts the author; the VOPR §9 detects divergence). A *conforming* system is race-free; the parallel path adds no new hole. Documented in the twin's header; the gate uses only conforming systems. |
+| 17 | **`std.debug.print` under `--listen`** | No `debug.print` in any `step_par` or gate test body (Phase-9 lesson — it corrupts the test-runner IPC). Pins are asserted; recompute via a guarded non-test `dumpPin`. |
+
+### 13.6 The gate (the witness) — exact test list, each witness bullet → its assertion
+
+**New file `src/step_par_gate.zig`**, wired into the **base 3-mode `tmod` test** via `_ = @import("step_par_gate.zig");` in `root.zig`'s `test {}` block — NOT a dedicated build.zig artifact. The base matrix (build.zig:47-60) already runs `root`'s refAllDecls across Debug/ReleaseSafe/ReleaseFast, and `std.testing.io` is Threaded-backed there (the supervisor/proc tests prove it). A pure in-process thread gate has no worker-exe / `build_opts` dependency, so it needs no artifact of its own — strictly less build churn, and it gets the D2 cross-mode matrix for free. Uses `std.testing.io` and `testing.allocator` (thread-safe). NO `std.debug.print` in any test body; pins recomputed by a guarded non-test `dumpPin` (the `proc_gate.zig:370` idiom).
+
+**System set** (must have ≥1 genuinely multi-member parallel stage): widen replay.zig's `sys3` shape — e.g. Registry `{A,B,C,D}` with `writeA`/`writeB`/`writeC` mutually disjoint (one 3-member stage 0) and a `gather` reading A,B,C writing D (stage 1). All systems CONFORMING (declare exactly what they touch). Confirm `Schedule.stage_count == 2` and the writers share stage 0 via the schedule invariant. Per-tick stream folded into an `XxHash64` exactly like `replay.runTrajectory` (replay.zig:161-174).
+
+| # | Witness bullet | Assertion |
+|---|----------------|-----------|
+| T1 | **bit-identity (per build mode)** | Run K≈12 ticks twice from one seed: serial via `step.runScheduled`, parallel via `runScheduledPar(io=testing.io, n_threads=8)`. Fold each tick's `w.digest().hash` into a stream. `expectEqual(serial.stream, par.stream)` AND `expectEqual(serial.final, par.final)`. Multi-stage with a real parallel stage. |
+| T2 | **pinned cross-build (D2)** | `expectEqual(@as(u64, <PIN_FINAL>), par.final)` and `expectEqual(@as(u64, <PIN_STREAM>), par.stream)`. Passing under all 3 modes proves Debug==ReleaseSafe==ReleaseFast bit-identity of the threaded path. Pins recomputed once via `dumpPin` (outside `--listen`). |
+| T3 | **repeated-run identity** | Run `runScheduledPar(n_threads=8)` 16× → collect 16 stream digests → all equal the first. Scheduling nondeterminism does NOT leak into state. |
+| T4 | **recording-on byte-identity** | One trajectory serial with a `Recorder`, one parallel (sub-recorders + `mergeSubLogs`). Serialize BOTH via `event_log.writeLog` into two ArrayLists; `expectEqualSlices(u8, serial_bytes, par_bytes)` AND `expectEqual(logDigest(serial).hash, logDigest(par).hash)`. Also assert events-ON par final hash == events-OFF par final hash (hash-invariance under threads). |
+| T5 | **order-permutation under threads** | Run `runScheduledPar` with `EXEC_CANON` and with a within-stage permuted `exec` (swap two stage-0 ids); `expectEqual` stream+final. The §4 property survives threading. |
+| T6 | **ACTUAL overlap (genuine parallelism, robust to high core count)** | A dedicated set where each of K mutually-non-conflicting same-stage systems does an in-process Io sleep before trivial deterministic work. **Before the run, `std.testing.io_instance.setAsyncLimit(.unlimited)` with `defer`-restore** (Threaded degrades `groupAsync` to inline-eager when `busy_count >= async_limit`, default `cpu_count-1` — Threaded.zig:1639/2197 — so an unraised limit can silently serialize a K-wide sleeping stage on a low-core box). Bracket wall-clock with `std.Io.Clock.now(.awake, io)` (proc_gate.zig:345-358). Assert `par_ms * 100 < seq_ms * 60`. Test BOTH a narrow (K=2) and a wide (K=6) sleeping stage to prove robustness to core count. On spawn-unavailable → `error.SkipZigTest` (honest, never a silent serial pass). |
+| T7 | **arena equivalence / degenerate delegation** | `runScheduledPar(io=null,…)` and `runScheduledPar(n_threads=1,…)` produce the identical hash to `step.runScheduled` (delegation correctness — arenas are not on this path; addresses change nothing). Empty-systems path runs the input prologue. |
+| T8 | **arena lifetime (cross-tick UAF guard)** | A ≥2-tick recording run where tick-2's merge must NOT read tick-1 freed arena bytes — asserts the strict dispatch→await→drain→merge→reset ordering by checking the merged log digest equals the single-threaded multi-tick log. |
+
+**The in-process sleep primitive for T6 is confirmed in-tree** (`worker.zig:51-52`):
+```zig
+const dur = std.Io.Clock.Duration{ .clock = .awake, .raw = std.Io.Duration.fromMilliseconds(MS) };
+dur.sleep(io) catch {};
+```
+Use exactly this in a gate-only sleeping system body (reads NO hashed state). This retires the "needs a spike" open question and avoids any busy-loop fallback.
+
+### 13.7 Ordered implementation checklist
+
+1. **Extract the drain** in `step.zig`: factor the gather+stable-sort-by-`(system_id,seq)`+apply block (step.zig:139-149) into `pub fn drainAndApply(comptime R, w: *World(R), gpa, bufs: []CommandBuffer(R))`; call it from `runScheduled`. Behavior-preserving — the existing step.zig tests re-prove it. (Hazard #14.)
+2. **Create `src/step_par.zig`**: imports, the comptime stage-slicer over `exec`, the `runOne` task fn, and the `await` happens-before citation comment.
+3. **`runScheduledPar`**: degenerate fallbacks first (verbatim delegate to `step.runScheduled` / `stepExec`); else allocate `arenas`/`bufs`/`emitters`/`errs`/(opt.)`subs` on the orchestrator thread, **pre-reserve each arena** (alloc-then-`reset(.retain_capacity)`), compute `order` once, per-stage dispatch with inline-last + `group.await` barrier, surface `errs` in sid order, call `step.drainAndApply`, then `mergeSubLogs` (if `rec`), then reset/deinit arenas — in that strict order. (Hazards #4,#5,#11,#15.)
+4. **`mergeSubLogs`**: the direct-slice merge (§13.3), slicing each sub-log arena by the event's own offsets.
+5. **`stepExecPar` / `stepPar`**: clone + `tick +%= 1` + input-command prologue (single-threaded, copied from `stepExec`), then `runScheduledPar`.
+6. **`root.zig`**: append the 5 exports + `_ = step_par;` and `_ = @import("step_par_gate.zig");` in the `test {}` block.
+7. **`src/step_par_gate.zig`**: the 4-system set + the K-wide sleeping set; tests T1–T8; the guarded `dumpPin`.
+8. **Recompute pins** via `dumpPin` (outside `--listen`), freeze `PIN_FINAL`/`PIN_STREAM` and the merged-log digest into T2/T4.
+9. **Module header docs**: the `n_threads>1 ⇒ thread-safe-gpa-for-refill` constraint; the escape-hatch trust boundary; the `await`-is-a-fence citation.
+10. **Run** `zig build test` (all 3 modes) — base matrix must stay green, the 8 new gate tests green per mode.
+
+### 13.8 Residual risks
+
+- **gpa thread-safety on arena refill.** Pre-reservation removes the *common-case* concurrent gpa hit, but a system that allocates beyond its arena's high-water still refills concurrently, requiring a thread-safe gpa (documented constraint, satisfied by testing.allocator and any production thread-safe allocator). T6 uses sleep-bound systems, so it proves *dispatch* overlap but not that a *malloc-heavy* workload avoids serializing on refill — the honest soft spot. A future variant could size the high-water from a per-system heuristic to make the path fully caller-constraint-free.
+- **Overlap is proven "if given threads," not "the default pool overlaps."** `setAsyncLimit(.unlimited)` forces one thread per task in the gate; in production on a fixed pool a stage wider than the pool partially serializes (a throughput ceiling, not a correctness issue). **Open product decision:** production callers' limit policy — `.unlimited`, a tuned limit, or the default `cpu_count-1`. Document the chosen default; restore the process-global `testing.io_instance` limit with `defer` so the wide-stage and other gate tests in the same binary are not cross-coupled.
+- **CI timing noise.** The 60% margin is inherited from proc_gate (which passes across processes on this toolchain); in-process thread spawn is cheaper than process spawn, so the margin should be safer, but a heavily loaded box can still be noisy — may need margin-tuning or a retry on unusual hardware.
+- **Scope: comptime path only.** `runScheduledParDynamic` (a threaded twin of `runScheduledDynamic` for dlopen'd runtime system sets) is a declared follow-on seam — the merge/arena design is identical (recover stages from `schedule.stagesDynamic`, heap-allocate sized-at-runtime arenas/subs) — explicitly NOT silently dropped, out of scope here.
+
+Gate target: **+16 in-process thread gate tests per mode** (Debug/ReleaseSafe/ReleaseFast) folded into the base suite — zero new build artifacts.
+
+### Phase 2b notes (from the adversarial review — 6 dimensions, 14 confirmed / 2 refuted; the HIGH + both MEDIUMs and the substantive LOWs fixed before commit)
+
+1. **HIGH — the witness only proved determinism, not thread-safety (fixed).** The functional bit-identity tests (T1–T5) ran at the DEFAULT `async_limit`. `std.Io.Threaded` eager-inlines a `group.async` task on the caller once `busy_count >= async_limit` (default `cpu_count-1`); on a low-core box that is `.limited(0)` → every task inlines → the "parallel" path is fully serial, yet an equality assertion still passes (the spine is deterministic when serial). Only T6 forced overlap, and it used READ-ONLY sleepers — so NO green test exercised the actual hazards (concurrent disjoint-column writes, concurrent keyed RNG, concurrent sub-recorder emits+merge) under true concurrency. The reviewer proved it by running T1 under `.limited(0)` (passed, fully serialized). **Fix:** every functional concurrency test now brackets the run with `setAsyncLimit(.unlimited)` (`forceOverlap`, restored via defer) so the pool grows a thread per task on ANY core count; and **T9** was added — a *data-bearing* overlap proof whose disjoint-column-WRITING systems SLEEP, so they provably execute SIMULTANEOUSLY (measured wall-clock overlap) while writing columns / drawing RNG / emitting, asserting the result is bit-identical to serial (race-free) AND overlapped (genuine).
+2. **MEDIUM — T6 hard-failed instead of `error.SkipZigTest` on a spawn-incapable build (fixed).** §13.6 mandated an honest skip; T6 had none. Added `if (builtin.single_threaded) return error.SkipZigTest;` to T6 and T9 (the compile-time no-threads case).
+3. **MEDIUM — the genuine-overlap witness used a read-only, RNG-free, record-free workload (fixed by T9).** The data-bearing concurrent path is now force-overlapped (see #1).
+4. **LOW (fixed):** the parallel branch now validates `exec` is a stage-GROUPED permutation in safe builds (a malformed exec would escalate to a data race, unlike the serial path's benign wrong result); `mergeSubLogs` now runs BEFORE the drain (recording precedes the drain, mirroring the spine); T4's set gained a 2-emit-with-explicit-cause system (witnesses the per-sub-recorder `cur_sa` dedup + a multi-element cause list through the merge) and a zero-emit system (witnesses an empty sub-log contributes nothing); T5 now pins the permuted-exec MERGED LOG (not just the world hash); **T10** witnesses a system fault is SURFACED in ascending-sid order (not swallowed by `group.async`'s `catch {}`); **T11** drives `stepExecPar` through a `FailingAllocator` (clean teardown, no leak); the `n_threads` doc now states the actual overlap degree is owned by the passed `io` (`async_limit`), not `n_threads`.
+5. **Refuted (2):** "`group.await catch {}` leaves torn buffers after a swallowed `error.Canceled`" — `await` completes all member tasks before returning, so post-barrier reads are well-defined; "per-system arena stack array has no documented ceiling" — the N-sized arrays are bounded by the comptime system count exactly as the serial path's `[N]CommandBuffer` is, and the warm-loop's gpa pressure premise was factually wrong.

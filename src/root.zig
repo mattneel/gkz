@@ -151,6 +151,15 @@ pub const stepDynamic = step_mod.stepDynamic;
 pub const runScheduledDynamic = step_mod.runScheduledDynamic;
 pub const execOrderDynamic = schedule.execOrderDynamic;
 
+// Phase 2b (§4 / PLAN §13): the PARALLEL in-process scheduler twin — runs a stage's conflict-free
+// systems across threads, bit-/byte-identical to the single-threaded spine. `n_threads>1` requires a
+// thread-safe gpa (per-system arena refill); io==null or n_threads<=1 delegates to `step.runScheduled`.
+pub const step_par = @import("step_par.zig");
+pub const runScheduledPar = step_par.runScheduledPar;
+pub const stepExecPar = step_par.stepExecPar;
+pub const stepPar = step_par.stepPar;
+pub const mergeSubLogs = step_par.mergeSubLogs;
+
 /// Bring-up placeholder so the scaffold `main.zig` keeps compiling during Phase 1. Replaced by a real
 /// kernel demo once `step`/`snapshot`/`replay` land.
 pub fn printAnotherMessage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -174,6 +183,8 @@ test {
     _ = simctx;
     _ = schedule;
     _ = step_mod;
+    _ = step_par;
+    _ = @import("step_par_gate.zig");
     _ = snapshot_mod;
     _ = replay_mod;
     _ = event;

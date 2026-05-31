@@ -10,8 +10,10 @@ Elm/Redux (state-as-value, time-travel), and `rr` (record-replay) — not the ma
 The primary user is an **AI** — authoring game logic and debugging running games. Every design choice
 is justified by one of those two jobs.
 
-> **Status:** Phases 1–9 are complete and verified — the foundation (the World as a value + pure
-> `step`), the deterministic scheduler (§4), events & causality (§5), the **VOPR** deterministic
+> **Status:** Phases 1–9 (plus **Phase 2b**, real in-process multithreaded stage execution) are complete
+> and verified — the foundation (the World as a value + pure
+> `step`), the deterministic scheduler (§4) now running stages **across threads** bit-identically to the
+> serial spine, events & causality (§5), the **VOPR** deterministic
 > simulator/defect-finder (§9), the **relational query surface** (§7), **specs/invariants/temporal
 > properties** (§8), **agent harnesses & evaluation** (§10), **hot-reload & schema migration** (§12), and
 > the **process model & control plane** (§13): one-process-per-sim supervision with real cross-process
@@ -54,11 +56,11 @@ zig build run      # build and run the CLI
 zig build          # build the CLI to zig-out/bin/gkz
 ```
 
-`zig build test` is the determinism gate: it runs **900 tests in all three optimize modes** and pins a
+`zig build test` is the determinism gate: it runs **948 tests in all three optimize modes** and pins a
 suite of digests — an end-to-end content hash, a per-tick hash-stream digest, an event-log digest, the
-VOPR's frozen replay constants, the eight query-result digests, the violation/spec/metric digests, and a
-frozen v1 migration image + migrated-World digests + reload-stream digest — asserted identically in every
-mode. All three modes passing *proves* `Debug == ReleaseSafe ==
+VOPR's frozen replay constants, the eight query-result digests, the violation/spec/metric digests, a
+frozen v1 migration image + migrated-World digests + reload-stream digest, and the **threaded** per-tick /
+merged-log pins (the Phase-2b cross-build witness) — asserted identically in every mode. All three modes passing *proves* `Debug == ReleaseSafe ==
 ReleaseFast` bit-identity: under integer overflow (which ReleaseFast does not trap), across permuted
 system execution order, whether or not events are recorded, regardless of physical table/log layout, and
 with invariant checks compiled in or out.
@@ -97,8 +99,16 @@ art** — abstract placeholders only.
 A system declares its data access *in its `Query` type*; the scheduler derives a deterministic stage
 order, and all structural change is deferred to one end-of-tick command-buffer drain (applied in
 `(system_id, seq)` order). So results are **independent of execution order** — proven by an
-order-permutation gate. Real multithreaded execution (Phase 2b) is a drop-in the architecture already
-makes safe.
+order-permutation gate.
+
+**Phase 2b — real in-process multithreading (`step_par.zig`).** Each stage's conflict-free systems now
+run on a thread pool (`Io.Group` per stage, barrier between stages), the dual of Phase 9's cross-*process*
+parallelism. Because same-stage systems write disjoint columns (the conflict rule), defer structural
+change to per-system command buffers, draw only keyed/pure RNG, and record into per-system event sub-logs
+merged in `exec` order, the threaded per-tick hash and merged event log are **bit-/byte-identical** to the
+single-threaded spine. The witness *forces* real overlap (`setAsyncLimit(.unlimited)`) on the
+column-write / RNG / emit paths and proves it (sleeping disjoint-column writers measurably overlap while
+producing the serial result) — not a disguised serial loop on a high-core box.
 
 ### Phase 3 — Events & causality (SPEC §5)
 
@@ -249,6 +259,7 @@ contract:
 
 - **Phase 1** — Foundation ✅
 - **Phase 2** — Systems & deterministic scheduler ✅
+- **Phase 2b** — real in-process multithreaded stage execution (`step_par.zig`): threads per stage, bit-/byte-identical to the spine, with forced + measured overlap on the data-bearing path ✅
 - **Phase 3** — Events & causality ✅
 - **Phase 4** — The VOPR (deterministic simulator: fuzzing, divergence detection, minimal repro) ✅
 - **Phase 5** — Introspection & relational query surface (§7) ✅
@@ -257,7 +268,6 @@ contract:
 - **Phase 8** — Hot-reload & schema migration (§12): real `dlopen` native-systems loading + version-tagged `World→World` migrations ✅
 - **Phase 9** — Process model & control plane (§13): one-process-per-sim supervisor pool, cross-process sweep sharding, crash-as-repro harvesting, the query server ✅
 - **Next** — distributing workers to **other machines** (a `NetworkExecutor` over the same job/result frames; needs a second host to gate), plus the control-plane refinements: a watch-driven reload/migrate **trigger** (into Phase 8's `SystemSource` seam) and socket auth — all behind the `Executor`/`SystemSource` seams built here
-- **Phase 2b** — real thread-pool execution (the scheduler architecture already makes it safe)
 
 See [`PLAN.md`](./PLAN.md) §6 for the full phase map.
 

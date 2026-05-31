@@ -137,17 +137,33 @@ pub fn runScheduled(
         }
 
         // End-of-tick drain: gather every buffered command, stable-sort by (system_id, seq), apply.
-        var all: std.ArrayList(cmdbuf.Command(R)) = .empty;
-        defer all.deinit(gpa);
-        inline for (0..systems.len) |i| try all.appendSlice(gpa, bufs[i].list.items);
-        const Less = struct {
-            fn lt(_: void, a: cmdbuf.Command(R), b: cmdbuf.Command(R)) bool {
-                return if (a.system_id != b.system_id) a.system_id < b.system_id else a.seq < b.seq;
-            }
-        };
-        sortmod.sort(cmdbuf.Command(R), all.items, {}, Less.lt);
-        for (all.items) |c| try mutation.applyCommand(R, w, gpa, c);
+        // Extracted into `drainAndApply` so the parallel twin (step_par.runScheduledPar) shares the EXACT
+        // comparator + apply order — the (system_id, seq) total order can never drift serial vs threaded.
+        try drainAndApply(R, w, gpa, bufs[0..]);
     }
+}
+
+/// The end-of-tick drain, shared by `runScheduled`, `runScheduledDynamic`, and the parallel twin
+/// (`step_par.runScheduledPar`): gather every buffered command, stable-sort by `(system_id, seq)`, and
+/// apply in that order. The order is a pure function of (which system, that system's emission seq) —
+/// never of physical execution order or thread scheduling. Single-sourced here so the comparator cannot
+/// drift between the serial and threaded paths (a determinism hazard).
+pub fn drainAndApply(
+    comptime R: type,
+    w: *worldmod.World(R),
+    gpa: std.mem.Allocator,
+    bufs: []cmdbuf.CommandBuffer(R),
+) std.mem.Allocator.Error!void {
+    var all: std.ArrayList(cmdbuf.Command(R)) = .empty;
+    defer all.deinit(gpa);
+    for (bufs) |*b| try all.appendSlice(gpa, b.list.items);
+    const Less = struct {
+        fn lt(_: void, a: cmdbuf.Command(R), b: cmdbuf.Command(R)) bool {
+            return if (a.system_id != b.system_id) a.system_id < b.system_id else a.seq < b.seq;
+        }
+    };
+    sortmod.sort(cmdbuf.Command(R), all.items, {}, Less.lt);
+    for (all.items) |c| try mutation.applyCommand(R, w, gpa, c);
 }
 
 // --- runtime-systems path (hot-reload / dlopen) ---------------------------------------------------
@@ -195,16 +211,7 @@ pub fn runScheduledDynamic(
         try systems[sid].invoke(&ctx, &w.table, order);
     }
 
-    var all: std.ArrayList(cmdbuf.Command(R)) = .empty;
-    defer all.deinit(gpa);
-    for (bufs) |*b| try all.appendSlice(gpa, b.list.items);
-    const Less = struct {
-        fn lt(_: void, a: cmdbuf.Command(R), b: cmdbuf.Command(R)) bool {
-            return if (a.system_id != b.system_id) a.system_id < b.system_id else a.seq < b.seq;
-        }
-    };
-    sortmod.sort(cmdbuf.Command(R), all.items, {}, Less.lt);
-    for (all.items) |c| try mutation.applyCommand(R, w, gpa, c);
+    try drainAndApply(R, w, gpa, bufs);
 }
 
 /// Runtime twin of `stepExec`: the pure `(World, Input) -> World` over a runtime `systems` slice.
