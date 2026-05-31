@@ -4,10 +4,12 @@
 > order** it gets built, and records the architectural decisions made along the way. The primary user
 > is an AI; every decision below favors determinism, legibility, and a tight feedback loop.
 
-Status: **Phase 1 (Foundation) — implemented; all determinism gates green; adversarial review passed.**
-13 modules under `src/`, **219 tests** passing across Debug/ReleaseSafe/ReleaseFast, with pinned
-end-to-end + per-tick-stream hashes proving cross-build bit-identity (D2). A 5-lens adversarial review
-raised 20 findings (16 confirmed, no critical/high); all are fixed or documented (see §7). This document is the decision of record. It was produced from a
+Status: **Phases 1–2 implemented; all determinism gates green; both adversarial reviews passed.**
+**Phase 1 (Foundation)** + **Phase 2 (Systems & deterministic scheduler, §4)** are complete: **279 tests**
+passing across Debug/ReleaseSafe/ReleaseFast, with pinned end-to-end + per-tick-stream hashes proving
+cross-build bit-identity (D2) and an order-permutation gate proving execution-order independence. Two
+5-lens adversarial reviews raised 37 findings (31 confirmed, none critical/high); all fixed or
+documented (see §7). Phase 1 committed as `a589d39`; Phase 2 pending commit. This document is the decision of record. It was produced from a
 3-architecture judge panel (5 independent lenses + synthesis) over ground truth extracted from
 SPEC.md, the `fpz` dependency, and the live Zig 0.16.0 toolchain.
 
@@ -298,7 +300,7 @@ Phase-1 `deferred_with_seams` provisions, so later phases bolt on without rework
 | Phase | SPEC | Scope | Key new seam consumed |
 |---|---|---|---|
 | **1. Foundation** *(this plan)* | §1,2,3,6 | ECS-as-value, pure `step`, canonical serialize+hash, snapshot, deterministic replay, cross-build gate. | — establishes all |
-| **2. Systems & deterministic scheduler** | §4 | comptime `Read/Write/With/Without` access sets; `Query`; DAG conflict detection `(writeA & (readB\|writeB))`; per-system **command buffers** applied in `(system_id, entity_id)` order; single-thread deterministic first, then parallel. | **S1, S2** |
+| **2. Systems & deterministic scheduler** ✅ | §4 | comptime `Read/Write/With/Without` access sets; `@compileError`-gated `Query`; DAG conflict detection `(writeA & (readB\|writeB))` → greedy comptime stages; per-system **command buffers** drained at one end-of-tick sync point in **`(system_id, seq)`** order (corrects the non-total "(system_id, entity_id)"); restricted `SimCtx`; single-thread + an **order-permutation determinism gate**. Real threads = 2b. | **S1, S2** |
 | *2b. SIMD/archetype upgrade (perf track)* | §3 | swap flat table → archetype tables behind the storage seam; SIMD batch path via `fpz.simd`. Hash/serialize/`step` unchanged. Extend cross-build gate to scalar-vs-SIMD overflow. | **S1** (sealed upgrade) |
 | **3. Events & causality** | §5 | event emitter threaded through `SimCtx` into a **side** log (never in the hashed World); causal graph; tiered (on-demand) provenance recording. | **S3** |
 | **4. VOPR** | §9 | seeded input driver; fault/timing injection (none may change the hash); property checking across seeds; divergence detection (the Phase-1 hash-stream compare, scaled); delta-debugged minimal `(seed,inputs)` repro. | reuses gate-3 harness |
@@ -344,3 +346,20 @@ netcode, asset import, editor) are out of kernel scope (§15) — only their one
    distinct slots hits an `@intCast` panic (a resource ceiling, not malformed input — distinct from the
    D2 "no input-dependent panic" guarantee). Astronomically unreachable; documented, not handled.
    *(Review finding zig#1, accepted.)*
+
+### Phase 2 notes (from the Phase-2 adversarial review — 15/17 confirmed, no critical/high)
+
+10. **Command payload ceiling = 64 KB.** `Command.payload_len` is a `u16`; a component whose *serialized*
+    size exceeds 65535 bytes is now a **compile error** (`comptime` assert in `command_buffer.zig`), the
+    same class of explicit resource ceiling as #9.
+11. **Keyed-RNG isolation is by `stream_id`, not `system_id`** (SPEC §2.4 faithful): two different
+    systems drawing with the same `(entity_id, stream_id)` in the same tick get the *same* value — a
+    feature (shared deterministic decision), not a bug. A system wanting independent randomness picks a
+    distinct `stream_id`. Documented on `SimCtx.rng`. *(Review finding determinism#1.)*
+12. **The Query access gate is an authoring aid, not a sandbox.** The system author is trusted (SPEC §15:
+    no scripting sandbox); the bare `*Table` is reachable on the `Query`/`RowView` handle, so a system
+    that deliberately reaches around `read`/`write` is possible and would be caught by the VOPR (§9) as
+    divergence. The gate makes the *honest* mistake uncompilable. *(Review finding spec#0, accepted.)*
+13. **Reflection negative cases are documented, not mechanically tested.** `Query.read`/`write` misuse
+    and malformed `system()` fns are `@compileError`s (verified by design; `system()` now emits clear
+    messages), but a failing-compile CI fixture is deferred. *(Review finding zig#1/tests#8, accepted.)*

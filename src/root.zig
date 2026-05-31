@@ -36,9 +36,29 @@ pub const Input = input.Input;
 
 pub const mutation = @import("mutation.zig");
 
+// --- Phase 2: systems, queries, scheduling, command buffers (SPEC §4) ---
+pub const query = @import("query.zig");
+pub const Query = query.Query;
+pub const Read = query.Read;
+pub const Write = query.Write;
+pub const With = query.With;
+pub const Without = query.Without;
+
+pub const command_buffer = @import("command_buffer.zig");
+pub const Command2 = command_buffer.Command;
+pub const CommandBuffer = command_buffer.CommandBuffer;
+
+pub const simctx = @import("simctx.zig");
+pub const SimCtx = simctx.SimCtx;
+
+pub const schedule = @import("schedule.zig");
+pub const Sys = schedule.Sys;
+pub const system = schedule.system;
+pub const Schedule = schedule.Schedule;
+
 pub const step_mod = @import("step.zig");
 pub const step = step_mod.step;
-pub const System = step_mod.System;
+pub const runScheduled = step_mod.runScheduled;
 
 pub const snapshot_mod = @import("snapshot.zig");
 pub const Snapshot = snapshot_mod.Snapshot;
@@ -66,6 +86,10 @@ test {
     _ = world;
     _ = input;
     _ = mutation;
+    _ = query;
+    _ = command_buffer;
+    _ = simctx;
+    _ = schedule;
     _ = step_mod;
     _ = snapshot_mod;
     _ = replay_mod;

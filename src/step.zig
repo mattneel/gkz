@@ -1,47 +1,117 @@
-//! The step function — the kernel's spine (SPEC §1/§4, PLAN.md build-order step 11; resolves Q8).
+//! The step function — now scheduler-driven (SPEC §1/§4, PLAN.md Phase 2; F7). Build-order step 6.
 //!
-//! `step` is a pure function `(World, Input) -> World`: it clones the previous World (value semantics —
-//! the input is never mutated, D1), advances the tick, applies the tick's commands in canonical order
-//! through the `Mutation`/`apply` seam (S2), then runs a caller-supplied ordered list of systems. In
-//! Phase 1 the systems list is a fixed 1-element slice; in §4 the scheduler supplies a DAG-ordered
-//! slice — a call-site change, not a rewrite of `step`. Everything `step` touches is integer/fixed-point
-//! and total, so the result is bit-identical across build modes and architectures (D2/D7).
+//! `step` is still the pure spine `(World, Input) -> World`. Per tick it: clones `prev` (value
+//! semantics, D1); advances the tick; applies the tick's *input* commands (the Phase-1 structural path,
+//! unchanged); then runs a comptime-scheduled set of systems and drains their command buffers.
+//!
+//! Systems run in the deterministic order derived by the comptime `Schedule` (stage-grouped, ascending
+//! system id within a stage). Each system gets a restricted `SimCtx` and a `Query`; it edits its
+//! declared-Write components in place (stage-disjoint, so order-free) and defers structural /
+//! cross-entity changes into its own command buffer. After ALL systems run, the single end-of-tick
+//! drain concatenates every buffer, stable-sorts by `(system_id, seq)`, and applies them via
+//! `mutation.applyCommand`. Because no system observes another's structural change mid-tick, and the
+//! drain order is a pure function of (which system, that system's emission count) — never of physical
+//! execution order — the result is independent of the order systems ran in (and, in Phase 2b, of
+//! threads). See the order-permutation gate in replay.zig.
+//!
+//! SPEC-text deviation (documented in mutation.zig): the drain key is `(system_id, seq)`, not the
+//! literal "(system id, then entity id)" — the latter is not a total order when one system emits two
+//! commands at the same entity.
 
 const std = @import("std");
 const worldmod = @import("world.zig");
 const input = @import("input.zig");
 const mutation = @import("mutation.zig");
+const schedule = @import("schedule.zig");
+const simctx = @import("simctx.zig");
+const cmdbuf = @import("command_buffer.zig");
+const sortmod = @import("sort.zig");
 const Input = input.Input;
+const Sys = schedule.Sys;
+const SimCtx = simctx.SimCtx;
 
-/// A system is a pure transform over the World. (Phase 1: receives the World + an allocator for
-/// transient working memory such as the canonical iteration order. The §4 `SimCtx` — event emitter,
-/// declared access set — is layered here later without changing the World/Input contract.)
-pub fn System(comptime Reg: type) type {
-    return *const fn (w: *worldmod.World(Reg), gpa: std.mem.Allocator) std.mem.Allocator.Error!void;
-}
-
-/// Advance the simulation one tick. Returns a new World; `prev` is untouched and remains owned by the
-/// caller. The returned World must be `deinit`'d by the caller.
+/// Advance the simulation one tick. Returns a new World; `prev` is untouched (caller owns both).
 pub fn step(
-    comptime Reg: type,
+    comptime R: type,
     gpa: std.mem.Allocator,
-    prev: worldmod.World(Reg),
+    prev: worldmod.World(R),
     in: Input,
-    comptime systems: []const System(Reg),
-) std.mem.Allocator.Error!worldmod.World(Reg) {
+    comptime systems: []const Sys(R),
+) std.mem.Allocator.Error!worldmod.World(R) {
     var w = try prev.clone(gpa);
     errdefer w.deinit(gpa);
 
-    w.tick +%= 1; // wrapping (D2): never a build-mode-divergent overflow
+    w.tick +%= 1; // wrapping (D2)
 
+    // Input-command path (Phase 1, unchanged): structural verbs applied in canonical order.
     const cmds = try input.canonicalize(gpa, in.commands);
     defer gpa.free(cmds);
     for (cmds) |c| {
-        if (mutation.commandToMutation(Reg, c)) |m| try mutation.apply(Reg, &w, gpa, m);
+        if (mutation.commandToMutation(R, c)) |m| try mutation.apply(R, &w, gpa, m);
     }
 
-    inline for (systems) |sys| try sys(&w, gpa);
+    // Scheduled systems, run in the deterministic comptime-derived order.
+    const exec = comptime &schedule.Schedule(R, systems).exec_order;
+    try runScheduled(R, &w, gpa, systems, exec);
     return w;
+}
+
+/// Run `systems` in the given `exec` order (a permutation of all system ids), then drain their command
+/// buffers deterministically. Production passes the canonical `Schedule.exec_order`; the
+/// order-permutation determinism gate (replay.zig) passes within-stage permutations to prove the result
+/// is independent of execution order. `exec` must contain each system id exactly once.
+pub fn runScheduled(
+    comptime R: type,
+    w: *worldmod.World(R),
+    gpa: std.mem.Allocator,
+    comptime systems: []const Sys(R),
+    exec: []const u16,
+) std.mem.Allocator.Error!void {
+    // Precondition: `exec` is a permutation of [0, systems.len) — each system runs exactly once. The
+    // production caller passes `Schedule.exec_order`; the order-permutation gate passes valid within-
+    // stage permutations. Asserted (safe builds) so a malformed `exec` is caught, not a silent OOB.
+    std.debug.assert(exec.len == systems.len);
+    for (exec) |sid| std.debug.assert(sid < systems.len);
+
+    // `systems.len` is comptime, so this `if` is a comptime-known branch: with no systems the body —
+    // which builds and indexes a `[systems.len]` buffer array — is never *analyzed* (a fixed `[0]`
+    // array cannot be indexed even on an unreachable path, so an early `return` would not suffice).
+    if (systems.len != 0) {
+        // The table is structurally frozen during the run phase (structural change is deferred), so
+        // the canonical iteration order is computed once and shared by every system's Query.
+        const order = try w.table.canonicalOrder(gpa);
+        defer gpa.free(order);
+
+        var bufs: [systems.len]cmdbuf.CommandBuffer(R) = undefined;
+        inline for (0..systems.len) |i| bufs[i] = cmdbuf.CommandBuffer(R).init(gpa, @intCast(i));
+        defer {
+            inline for (0..systems.len) |i| bufs[i].deinit();
+        }
+        var ev = simctx.EventEmitter{};
+
+        for (exec) |sid| {
+            var ctx = SimCtx(R){
+                .tick = w.tick,
+                .rng_root = w.rng_root,
+                .system_id = sid,
+                .cmd = &bufs[sid],
+                .events = &ev,
+            };
+            try systems[sid].invoke(&ctx, &w.table, order);
+        }
+
+        // End-of-tick drain: gather every buffered command, stable-sort by (system_id, seq), apply.
+        var all: std.ArrayList(cmdbuf.Command(R)) = .empty;
+        defer all.deinit(gpa);
+        inline for (0..systems.len) |i| try all.appendSlice(gpa, bufs[i].list.items);
+        const Less = struct {
+            fn lt(_: void, a: cmdbuf.Command(R), b: cmdbuf.Command(R)) bool {
+                return if (a.system_id != b.system_id) a.system_id < b.system_id else a.seq < b.seq;
+            }
+        };
+        sortmod.sort(cmdbuf.Command(R), all.items, {}, Less.lt);
+        for (all.items) |c| try mutation.applyCommand(R, w, gpa, c);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -50,90 +120,132 @@ pub fn step(
 
 const testing = std.testing;
 const fpz = @import("fpz");
-const rng = @import("rng.zig");
 const Registry = @import("registry.zig").Registry;
+const query = @import("query.zig");
+const Read = query.Read;
+const Write = query.Write;
+const Query = query.Query;
+const system = schedule.system;
 
 const Position = struct {
     x: fpz.Fixed,
     y: fpz.Fixed,
     pub const kind_id: u16 = 1;
 };
-const Game = Registry(.{Position});
-const W = worldmod.World(Game);
+const Velocity = struct {
+    dx: fpz.Fixed,
+    dy: fpz.Fixed,
+    pub const kind_id: u16 = 2;
+};
+const Reg = Registry(.{ Position, Velocity });
+const W = worldmod.World(Reg);
 
-/// Phase-1 demo system: ensure every live entity has a Position, then nudge each by a keyed-RNG delta
-/// in [-1,1] using the total `addSat` (no overflow panic → no build-mode divergence). Exercises keyed
-/// RNG + fixed-point math + component add/get + canonical iteration in one loop.
-fn demoSystem(w: *W, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
-    const order = try w.table.canonicalOrder(gpa);
-    defer gpa.free(order);
-    const owners = w.table.owners();
-    for (order) |row| {
-        const e = owners[row];
-        if (!w.has(e, Position)) w.add(e, Position, .{ .x = fpz.Fixed.ZERO, .y = fpz.Fixed.ZERO });
-        const p = w.get(e, Position).?;
-        const dx = rng.drawFixed(w.rng_root, w.tick, e.index, 0, fpz.Fixed.NEG_ONE, fpz.Fixed.ONE);
-        const dy = rng.drawFixed(w.rng_root, w.tick, e.index, 1, fpz.Fixed.NEG_ONE, fpz.Fixed.ONE);
-        p.x = p.x.addSat(dx);
-        p.y = p.y.addSat(dy);
+// in-place: integrate Position by Velocity (reads Velocity, writes Position)
+fn moveSystem(ctx: *SimCtx(Reg), q: *Query(Reg, .{ Read(Velocity), Write(Position) })) std.mem.Allocator.Error!void {
+    _ = ctx;
+    while (q.next()) |row| {
+        const v = row.read(Velocity).*;
+        const p = row.write(Position);
+        p.x = p.x.addSat(v.dx);
+        p.y = p.y.addSat(v.dy);
     }
 }
+// in-place: jitter Velocity from keyed RNG (writes Velocity) — disjoint from Position
+fn jitterSystem(ctx: *SimCtx(Reg), q: *Query(Reg, .{Write(Velocity)})) std.mem.Allocator.Error!void {
+    while (q.next()) |row| {
+        const e = row.entity();
+        row.write(Velocity).dx = ctx.rngFixed(e.index, 0, fpz.Fixed.NEG_ONE, fpz.Fixed.ONE);
+    }
+}
+// deferred structural: spawn one new entity per tick (via the command buffer)
+fn spawnerSystem(ctx: *SimCtx(Reg), q: *Query(Reg, .{Read(Position)})) std.mem.Allocator.Error!void {
+    if (q.next()) |_| try ctx.cmd.spawn(); // at most one spawn/tick (first matched entity)
+}
 
-const demo_systems = [_]System(Game){&demoSystem};
+const move_only = [_]Sys(Reg){system(Reg, "move", moveSystem)};
+const move_and_spawn = [_]Sys(Reg){ system(Reg, "move", moveSystem), system(Reg, "spawner", spawnerSystem) };
+const move_and_jitter = [_]Sys(Reg){ system(Reg, "move", moveSystem), system(Reg, "jitter", jitterSystem) };
 
-const no_input = Input{ .tick = 0, .commands = &.{} };
+fn seedWorld(gpa: std.mem.Allocator, n: u32) !W {
+    var w = W.init(0xC0FFEE);
+    errdefer w.deinit(gpa);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const e = try w.spawn(gpa);
+        w.add(e, Position, .{ .x = fpz.Fixed.ZERO, .y = fpz.Fixed.ZERO });
+        w.add(e, Velocity, .{ .dx = fpz.Fixed.ONE, .dy = fpz.Fixed.fromInt(2) });
+    }
+    return w;
+}
 
-test "step is pure: same (world, input) yields identical successors, input untouched" {
+test "step is pure: same (world, input) yields identical successors; prev untouched; tick advances" {
     const gpa = testing.allocator;
-    var w0 = W.init(0xC0FFEE);
+    var w0 = try seedWorld(gpa, 3);
     defer w0.deinit(gpa);
-    _ = try w0.spawn(gpa);
-    _ = try w0.spawn(gpa);
-    const h_before = (try w0.digest(gpa)).hash;
+    const before = (try w0.digest(gpa)).hash;
 
-    var a = try step(Game, gpa, w0, no_input, &demo_systems);
+    const empty = Input{ .tick = 0, .commands = &.{} };
+    var a = try step(Reg, gpa, w0, empty, &move_only);
     defer a.deinit(gpa);
-    var b = try step(Game, gpa, w0, no_input, &demo_systems);
+    var b = try step(Reg, gpa, w0, empty, &move_only);
     defer b.deinit(gpa);
 
     try testing.expectEqual((try a.digest(gpa)).hash, (try b.digest(gpa)).hash); // pure
-    try testing.expectEqual(h_before, (try w0.digest(gpa)).hash); // prev untouched
+    try testing.expectEqual(before, (try w0.digest(gpa)).hash); // prev untouched
     try testing.expectEqual(@as(u64, 1), a.tick);
-    try testing.expect((try a.digest(gpa)).hash != h_before); // state advanced
+    // move integrated Position by Velocity(1,2): entity 0 now at (1,2)
+    try testing.expectEqual(@as(i64, 1), a.get(.{ .index = 0, .generation = 0 }, Position).?.x.toInt());
+    try testing.expectEqual(@as(i64, 2), a.get(.{ .index = 0, .generation = 0 }, Position).?.y.toInt());
 }
 
-test "spawn/despawn commands drive structural change through step" {
+test "a system's deferred spawn appears after the end-of-tick drain" {
+    const gpa = testing.allocator;
+    var w0 = try seedWorld(gpa, 2);
+    defer w0.deinit(gpa);
+
+    var w1 = try step(Reg, gpa, w0, .{ .tick = 1, .commands = &.{} }, &move_and_spawn);
+    defer w1.deinit(gpa);
+    // 2 seeded + 1 deferred spawn = 3
+    try testing.expectEqual(@as(usize, 3), w1.table.rowCount());
+}
+
+test "in-place writes are stage-disjoint and land; jitter+move compose deterministically" {
+    const gpa = testing.allocator;
+    // move reads Velocity & writes Position; jitter writes Velocity -> conflict -> 2 stages
+    const Sched = schedule.Schedule(Reg, &move_and_jitter);
+    try testing.expectEqual(@as(usize, 2), Sched.stage_count);
+
+    var w0 = try seedWorld(gpa, 2);
+    defer w0.deinit(gpa);
+    var a = try step(Reg, gpa, w0, .{ .tick = 1, .commands = &.{} }, &move_and_jitter);
+    defer a.deinit(gpa);
+    var b = try step(Reg, gpa, w0, .{ .tick = 1, .commands = &.{} }, &move_and_jitter);
+    defer b.deinit(gpa);
+    try testing.expectEqual((try a.digest(gpa)).hash, (try b.digest(gpa)).hash);
+}
+
+test "input-command path still drives spawn/despawn under the new step" {
     const gpa = testing.allocator;
     var w0 = W.init(1);
     defer w0.deinit(gpa);
-
-    const spawn_cmd = [_]input.Command{
+    const spawn3 = [_]input.Command{
+        .{ .actor = .{ .index = 0, .generation = 0 }, .verb = 1 },
         .{ .actor = .{ .index = 0, .generation = 0 }, .verb = 1 },
         .{ .actor = .{ .index = 0, .generation = 0 }, .verb = 1 },
     };
-    var w1 = try step(Game, gpa, w0, .{ .tick = 1, .commands = &spawn_cmd }, &demo_systems);
+    var w1 = try step(Reg, gpa, w0, .{ .tick = 1, .commands = &spawn3 }, &move_only);
     defer w1.deinit(gpa);
-    try testing.expectEqual(@as(usize, 2), w1.table.rowCount());
+    try testing.expectEqual(@as(usize, 3), w1.table.rowCount());
 }
 
 test "multi-tick run is deterministic across independent executions" {
     const gpa = testing.allocator;
-
-    const RunResult = struct {
+    const Runner = struct {
         fn run(g: std.mem.Allocator) !u64 {
-            var w = W.init(0xABCDEF);
-            // seed three entities
-            const c = [_]input.Command{
-                .{ .actor = .{ .index = 0, .generation = 0 }, .verb = 1 },
-                .{ .actor = .{ .index = 0, .generation = 0 }, .verb = 1 },
-                .{ .actor = .{ .index = 0, .generation = 0 }, .verb = 1 },
-            };
-            var next = try step(Game, g, w, .{ .tick = 1, .commands = &c }, &demo_systems);
-            w.deinit(g);
-            w = next;
+            var w = try seedWorld(g, 3);
             var t: u64 = 0;
-            while (t < 20) : (t += 1) {
-                next = try step(Game, g, w, no_input, &demo_systems);
+            while (t < 15) : (t += 1) {
+                const next = try step(Reg, g, w, .{ .tick = t + 1, .commands = &.{} }, &move_and_spawn);
                 w.deinit(g);
                 w = next;
             }
@@ -142,28 +254,103 @@ test "multi-tick run is deterministic across independent executions" {
             return h;
         }
     };
-
-    const h1 = try RunResult.run(gpa);
-    const h2 = try RunResult.run(gpa);
-    try testing.expectEqual(h1, h2);
+    try testing.expectEqual(try Runner.run(gpa), try Runner.run(gpa));
 }
 
-test "commands referencing never-existed / stale entities are deterministic no-ops (D2, tests#8)" {
+// --- Phase-2 review coverage: (system_id, seq) drain order, deferred ops, empty schedule ---
+
+// three read-only systems that each defer a set of Velocity.dx to a distinct value — mutually
+// non-conflicting (no in-place writes) so they share ONE stage; the drain's (system_id, seq) order
+// decides the winner (highest system_id last).
+fn setVelA(ctx: *SimCtx(Reg), q: *Query(Reg, .{Read(Position)})) std.mem.Allocator.Error!void {
+    while (q.next()) |row| try ctx.cmd.set(row.entity(), Velocity, .{ .dx = fpz.Fixed.fromInt(1), .dy = fpz.Fixed.ZERO });
+}
+fn setVelB(ctx: *SimCtx(Reg), q: *Query(Reg, .{Read(Position)})) std.mem.Allocator.Error!void {
+    while (q.next()) |row| try ctx.cmd.set(row.entity(), Velocity, .{ .dx = fpz.Fixed.fromInt(2), .dy = fpz.Fixed.ZERO });
+}
+fn setVelC(ctx: *SimCtx(Reg), q: *Query(Reg, .{Read(Position)})) std.mem.Allocator.Error!void {
+    while (q.next()) |row| try ctx.cmd.set(row.entity(), Velocity, .{ .dx = fpz.Fixed.fromInt(3), .dy = fpz.Fixed.ZERO });
+}
+fn velAdder(ctx: *SimCtx(Reg), q: *Query(Reg, .{Read(Position)})) std.mem.Allocator.Error!void {
+    while (q.next()) |row| try ctx.cmd.add(row.entity(), Velocity, .{ .dx = fpz.Fixed.ONE, .dy = fpz.Fixed.ZERO });
+}
+fn despawnFirst(ctx: *SimCtx(Reg), q: *Query(Reg, .{Read(Position)})) std.mem.Allocator.Error!void {
+    if (q.next()) |row| try ctx.cmd.despawn(row.entity());
+}
+fn addToFirst(ctx: *SimCtx(Reg), q: *Query(Reg, .{Read(Position)})) std.mem.Allocator.Error!void {
+    if (q.next()) |row| try ctx.cmd.add(row.entity(), Velocity, .{ .dx = fpz.Fixed.ONE, .dy = fpz.Fixed.ZERO });
+}
+
+const setters = [_]Sys(Reg){ system(Reg, "setA", setVelA), system(Reg, "setB", setVelB), system(Reg, "setC", setVelC) };
+const adder_only = [_]Sys(Reg){system(Reg, "adder", velAdder)};
+const race = [_]Sys(Reg){ system(Reg, "despawnFirst", despawnFirst), system(Reg, "addToFirst", addToFirst) };
+const no_systems = [_]Sys(Reg){};
+
+test "(system_id, seq) drain order: highest system_id wins, invariant to within-stage exec order" {
     const gpa = testing.allocator;
-    var w0 = W.init(0x1234);
+    // all three setters are read-only -> no conflict -> a single 3-member stage
+    try testing.expectEqual(@as(usize, 1), schedule.Schedule(Reg, &setters).stage_count);
+
+    var w0 = try seedWorld(gpa, 2);
     defer w0.deinit(gpa);
-    _ = try w0.spawn(gpa); // entity (0,0)
 
-    var base = try step(Game, gpa, w0, .{ .tick = 1, .commands = &.{} }, &demo_systems);
-    defer base.deinit(gpa);
+    var a = try w0.clone(gpa);
+    defer a.deinit(gpa);
+    a.tick +%= 1;
+    try runScheduled(Reg, &a, gpa, &setters, &[_]u16{ 0, 1, 2 }); // canonical
 
-    const junk = [_]input.Command{
-        .{ .actor = .{ .index = 9999, .generation = 0 }, .verb = 2 }, // out-of-range despawn
-        .{ .actor = .{ .index = 0, .generation = 7 }, .verb = 2 }, // stale-generation despawn
+    var b = try w0.clone(gpa);
+    defer b.deinit(gpa);
+    b.tick +%= 1;
+    try runScheduled(Reg, &b, gpa, &setters, &[_]u16{ 2, 0, 1 }); // within-stage permutation
+
+    try testing.expectEqual((try a.digest(gpa)).hash, (try b.digest(gpa)).hash);
+    // setC (highest system_id) applied last -> wins
+    try testing.expectEqual(@as(i64, 3), a.get(.{ .index = 0, .generation = 0 }, Velocity).?.dx.toInt());
+    try testing.expectEqual(@as(i64, 3), a.get(.{ .index = 1, .generation = 0 }, Velocity).?.dx.toInt());
+}
+
+test "deferred add drives through the scheduler + drain" {
+    const gpa = testing.allocator;
+    var w = W.init(0);
+    defer w.deinit(gpa);
+    const e0 = try w.spawn(gpa);
+    const e1 = try w.spawn(gpa);
+    w.add(e0, Position, .{ .x = fpz.Fixed.ZERO, .y = fpz.Fixed.ZERO });
+    w.add(e1, Position, .{ .x = fpz.Fixed.ZERO, .y = fpz.Fixed.ZERO });
+    try testing.expect(!w.has(e0, Velocity));
+
+    var w1 = try step(Reg, gpa, w, .{ .tick = 1, .commands = &.{} }, &adder_only);
+    defer w1.deinit(gpa);
+    try testing.expect(w1.has(e0, Velocity)); // deferred add landed at the drain
+    try testing.expectEqual(@as(i64, 1), w1.get(e1, Velocity).?.dx.toInt());
+}
+
+test "deferred despawn racing a deferred add to the same entity is deterministic" {
+    const gpa = testing.allocator;
+    var w0 = try seedWorld(gpa, 2);
+    defer w0.deinit(gpa);
+    // despawnFirst (system_id 0) drains before addToFirst (1): entity 0 is despawned, the add no-ops.
+    var a = try step(Reg, gpa, w0, .{ .tick = 1, .commands = &.{} }, &race);
+    defer a.deinit(gpa);
+    var b = try step(Reg, gpa, w0, .{ .tick = 1, .commands = &.{} }, &race);
+    defer b.deinit(gpa);
+    try testing.expectEqual((try a.digest(gpa)).hash, (try b.digest(gpa)).hash); // deterministic
+    try testing.expect(!a.isLive(.{ .index = 0, .generation = 0 })); // entity 0 despawned
+}
+
+test "empty systems list: schedule is empty and the input path still runs" {
+    const gpa = testing.allocator;
+    try testing.expectEqual(@as(usize, 0), schedule.Schedule(Reg, &no_systems).stage_count);
+    try testing.expectEqual(@as(usize, 0), schedule.Schedule(Reg, &no_systems).exec_order.len);
+
+    var w0 = W.init(1);
+    defer w0.deinit(gpa);
+    const spawn2 = [_]input.Command{
+        .{ .actor = .{ .index = 0, .generation = 0 }, .verb = 1 },
+        .{ .actor = .{ .index = 0, .generation = 0 }, .verb = 1 },
     };
-    var with_junk = try step(Game, gpa, w0, .{ .tick = 1, .commands = &junk }, &demo_systems);
-    defer with_junk.deinit(gpa);
-
-    // junk commands change nothing and never panic in any build mode
-    try testing.expectEqual((try base.digest(gpa)).hash, (try with_junk.digest(gpa)).hash);
+    var w1 = try step(Reg, gpa, w0, .{ .tick = 1, .commands = &spawn2 }, &no_systems);
+    defer w1.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), w1.table.rowCount()); // input spawns applied, no systems
 }
