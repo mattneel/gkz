@@ -10,13 +10,14 @@ Elm/Redux (state-as-value, time-travel), and `rr` (record-replay) — not the ma
 The primary user is an **AI** — authoring game logic and debugging running games. Every design choice
 is justified by one of those two jobs.
 
-> **Status:** Phases 1–8 are complete and verified — the foundation (the World as a value + pure
+> **Status:** Phases 1–9 are complete and verified — the foundation (the World as a value + pure
 > `step`), the deterministic scheduler (§4), events & causality (§5), the **VOPR** deterministic
 > simulator/defect-finder (§9), the **relational query surface** (§7), **specs/invariants/temporal
-> properties** (§8), **agent harnesses & evaluation** (§10), and **hot-reload & schema migration** (§12):
-> real `dlopen` native-system loading + version-tagged `World→World` migrations. The kernel runs headless,
-> end-to-end, with zero art, bit-identically across Debug/ReleaseSafe/ReleaseFast. See [`PLAN.md`](./PLAN.md)
-> for the full roadmap and [`SPEC.md`](./SPEC.md) for the design contract.
+> properties** (§8), **agent harnesses & evaluation** (§10), **hot-reload & schema migration** (§12), and
+> the **process model & control plane** (§13): one-process-per-sim supervision with real cross-process
+> determinism, sharded sweeps over worker processes, crash-as-repro harvesting, and a query server. The
+> kernel runs headless, end-to-end, with zero art, bit-identically across Debug/ReleaseSafe/ReleaseFast.
+> See [`PLAN.md`](./PLAN.md) for the full roadmap and [`SPEC.md`](./SPEC.md) for the design contract.
 
 ---
 
@@ -53,7 +54,7 @@ zig build run      # build and run the CLI
 zig build          # build the CLI to zig-out/bin/gkz
 ```
 
-`zig build test` is the determinism gate: it runs **837 tests in all three optimize modes** and pins a
+`zig build test` is the determinism gate: it runs **891 tests in all three optimize modes** and pins a
 suite of digests — an end-to-end content hash, a per-tick hash-stream digest, an event-log digest, the
 VOPR's frozen replay constants, the eight query-result digests, the violation/spec/metric digests, and a
 frozen v1 migration image + migrated-World digests + reload-stream digest — asserted identically in every
@@ -64,7 +65,7 @@ with invariant checks compiled in or out.
 
 ---
 
-## What's implemented (Phases 1–8)
+## What's implemented (Phases 1–9)
 
 The world is fully playable, testable, fuzzable, queryable, checkable, and agent-evaluable with **zero
 art** — abstract placeholders only.
@@ -204,6 +205,29 @@ it fail), and hot-swapping to a *different* `.so` mid-stream diverges at exactly
 the VOPR's divergence oracle. The kernel can't *prove* opaque reloaded code deterministic (§15 trusts the
 author), but it **detects** a bad reload.
 
+### Phase 9 — Process model & control plane (SPEC §13)
+
+| Module (`src/proc/`) | Responsibility |
+|---|---|
+| `job.zig` | The serializable job/result codecs (GKZJ1 sweep-shard/fork jobs, GKZK1 aggregate/final results); hostile-input hardened (job bytes cross an OS boundary). `R` is never serialized |
+| `executor.zig` | The `Executor` transport seam: `inProcessExecutor` (determinism floor) + `subprocessExecutor` (a real `std.process.run` child, temp-file job, timeout-bounded, crash/hang/spawn-fail harvested) |
+| `worker.zig` · `worker_main.zig` | The one-shot worker (`gkz worker <job>`): read a job, run it against a comptime-fixed registry, write the result frame to stdout |
+| `supervisor.zig` | The process pool: shard a sweep, dispatch index-addressed, restart-on-crash (the job is the repro), merge survivors in canonical shard-index order |
+| `qserver.zig` | The query server: `respond()` (unchanged) multiplexed across live sims by `sim_id`; a Unix-socket transport seam |
+
+A sim runs as **one OS process** (crash-isolation: a defect can't take the node down, *and* a crash is a
+repro, §9). A `Supervisor` shards a seed sweep across worker processes via an `Executor`, harvests each
+shard into an **index-addressed** slot, restarts a crashed worker a bounded number of times (recording the
+job as a re-runnable repro), and merges survivors by shard index — so the result is bit-identical to a
+single-process sweep, regardless of which process finished when (§4's "scheduling nondeterministic, results
+never are", lifted to processes). The control plane is **exogenous** — it never enters the determinism
+guarantee — but it must *preserve* determinism, and the gate proves it: a real subprocess's per-tick result
+bytes **equal the in-process bytes and pin to the same digest in all three modes**, a deliberately crashing
+worker is harvested as a `Term.signal` repro (which a disguised in-process run structurally cannot fake),
+and a hung worker is killed by the timeout. Deferred behind the `Executor`/`SystemSource` seams:
+multi-machine distribution, parallel `Io.async` dispatch, the socket accept-loop + auth, and the reload/
+migrate *trigger*.
+
 ### Determinism contract (the spine)
 
 `step` is pure; the World is a value; all randomness is a keyed, counter-based pure function; the
@@ -215,7 +239,7 @@ raw memory, never hash-map order, never pointers, always little-endian). These r
 
 ## Roadmap
 
-Phases 1–8 are done. Later phases bolt onto clean seams without reworking the storage/serialize/hash
+Phases 1–9 are done. Later work bolts onto clean seams without reworking the storage/serialize/hash
 contract:
 
 - **Phase 1** — Foundation ✅
@@ -226,7 +250,8 @@ contract:
 - **Phase 6** — Specifications, invariants & properties (§8) ✅
 - **Phase 7** — Agent harnesses & evaluation (§10) ✅
 - **Phase 8** — Hot-reload & schema migration (§12): real `dlopen` native-systems loading + version-tagged `World→World` migrations ✅
-- **Phase 9+** — Process model & control plane (§13): supervisor pool, the query server, cross-process sweep sharding ← *next* (a watch-driven / control-plane reload **trigger** plugs into Phase 8's `SystemSource` seam here; the loader mechanism is already built)
+- **Phase 9** — Process model & control plane (§13): one-process-per-sim supervisor pool, cross-process sweep sharding, crash-as-repro harvesting, the query server ✅
+- **Next** — the §13 control-plane surface: a watch-driven reload/migrate **trigger** (into Phase 8's `SystemSource` seam), parallel `Io.async` dispatch, multi-machine distribution + a real socket protocol (all behind the `Executor` seam built here)
 - **Phase 2b** — real thread-pool execution (the scheduler architecture already makes it safe)
 
 See [`PLAN.md`](./PLAN.md) §6 for the full phase map.

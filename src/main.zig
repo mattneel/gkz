@@ -2,16 +2,25 @@ const std = @import("std");
 const Io = std.Io;
 
 const gkz = @import("gkz");
+// The §13 worker subcommand's example registry (a real deployment swaps in its own sim's registry).
+const worker_example = @import("proc/worker_example/shared.zig");
 
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-
     // This is appropriate for anything that lives as long as the process.
     const arena: std.mem.Allocator = init.arena.allocator();
 
     // Accessing command line arguments:
     const args = try init.minimal.args.toSlice(arena);
+
+    // §13: `gkz worker <job_file>` runs ONE sim job and writes its result frame to stdout (one process
+    // per sim — the supervisor spawns these). Dispatched before any banner so stdout carries only the
+    // result frame.
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "worker")) {
+        return gkz.proc.runWorker(worker_example, init);
+    }
+
+    // Prints to stderr, unbuffered, ignoring potential errors.
+    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
     for (args) |arg| {
         std.log.info("arg: {s}", .{arg});
     }

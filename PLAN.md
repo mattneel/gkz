@@ -800,3 +800,105 @@ and reload across a CHANGED registry (that crosses into the migration layer). A 
 forbids `dlopen` fails the reload-gate honestly (the base suite is a separate, unaffected artifact).
 
 Gate: **837 tests green** (275 base + 4 reload-gate per Debug/ReleaseSafe/ReleaseFast).
+
+---
+
+## 12. Phase 9 design — §13 process model & control plane (decision of record, from the design judge-panel)
+
+4-architect / 4-lens judge panel + synthesis. **Spine = an `Executor(R)` transport seam** (modeled verbatim on Phase-8's
+`reload.SystemSource{ctx, vtable}`) with TEMP-FILE job delivery via `std.process.run` and a supervisor that merges by shard
+index. New namespace `src/proc/` (keeps clear of `src/migrate/`). Mirrors the Phase-8 dlopen pattern exactly: an **always-gateable
+in-process** impl + a **real-subprocess** impl behind a Linux/capability guard, with a cross-process determinism witness that
+can't be faked.
+
+**Worker / job model (`proc/job.zig`):** a `Job = union{ sweep_shard{range: ShardRange, max_ticks, oracle_set_id:u16,
+metric_id:u16}, fork{snapshot_bytes, base_tick, base_hash, diverged_inputs, tick_budget} }` and a `Result = union{ aggregate:
+metric.Aggregate(T) (+ optional harvested defect coords), final{snapshot_bytes, stream_digest} }` — serializable VALUES via a
+GKZJ1/GKZK1 codec (5-byte magic + u16 version + arm tag, reusing `serialize.putInt`/`writeValue` + the snapshot/Aggregate/input
+codecs; hostile bytes → `serialize.Error`, never panic). **R is never serialized** — R is CODE (systems/oracles/seed_world), so
+it is comptime-FIXED per worker build via a shared module (`proc/worker_example/shared.zig`, the `reload_example/shared.zig`
+pattern); the job carries only DATA + `u16` selector ids into R-fixed comptime tables. Build the worker exe in the SAME optimize
+mode as the gate (host-mode == worker-mode ABI discipline).
+
+**Transport (`proc/executor.zig`):** `Executor(R){ctx, runFn}` → `Outcome = union{ ok, crashed: Crash{term, repro_job}, spawn_failed}`.
+(a) `inProcessExecutor` decodes the job and runs `vopr.sweep`/`metric.aggregate`/`restore+step` INLINE — the determinism floor,
+always gateable. (b) `subprocessExecutor` writes the job to a TEMP FILE and runs `std.process.run(gpa, io, .{argv={exe,"worker",
+job_path}, .timeout=.{.duration=std.Io.Duration.fromMilliseconds(N)}})` — the ONLY spawn+collect path that carries a timeout
+(`Child.wait` has none) and forces `.stdin=.ignore` (so temp-file delivery, not a stdin pipe, avoids deadlock and bounds every job
+size). Harvest on `Child.Term`: `.exited==0`→parse `[u32 len][GKZK1]` from stdout; `.signal`/nonzero→`crashed{repro_job=job
+bytes}` (a SIGSEGV surfaces here, NOT a parent crash — the one-process-per-sim isolation); `error.Timeout`→`crashed{.timed_out}`
+(run's internal `defer child.kill` already reaped); `SpawnError`→`spawn_failed` (the sandbox-deny path → gate `SkipZigTest`).
+
+**Supervisor (`proc/supervisor.zig`):** a process pool (no globals; explicit gpa+io+Executor+n_workers+max_restarts). PLAN
+shards via `shardRanges`; DISPATCH through an n_worker slot pool into an INDEX-ADDRESSED `results[shard_i]` (never append-on-
+arrival); RESTART-on-crash records `Defect{shard_i, range, term, repro_job}` (a re-runnable repro, §9) up to `max_restarts`;
+HARVEST merges in CANONICAL shard-index order via `mergeAggregates`, defects sorted by (shard_i, seed, tick). The §4 "physical
+scheduling nondeterministic, results never are" principle lifted to PROCESSES: arrival order never leaks into the bytes; the
+merged Aggregate is bit-identical to the unsharded single-process sweep.
+
+**Query server (`proc/qserver.zig`):** the IO shell around the ALREADY-PURE `query/wire.respond()` (unchanged — wire.zig:6-7
+anticipates exactly this). A `SimRegistry` (`AutoHashMap(u32,*SimHandle)`, `SimHandle{world:*const World, log:*const EventLog}` —
+Engine borrows `*const`, D1 preserved); routes `[u32 len][u32 sim_id][GKZQ1]` → `Engine(R,systems).init` → `respond` →
+`[len][GKZR1]`. Transport mirrors the Executor seam: in-process channel (gate path, everywhere) + a Linux-gated
+`std.Io.net.UnixAddress` Unix-domain socket at a temp path (no TCP port flakiness).
+
+**Gate (`proc/proc_gate.zig`, Linux-guarded per-mode artifact):** example sim = the verbatim `eval.zig` demo (R=Registry{Health},
+`drain` hp-=1, `seedHp(seed)=2+seed`, `timeToCondition(0)`; seeds 0..3 over max_ticks=4 → time-to-dead 2,3,4 → Aggregate.sum=9, a
+known in-tree number). Pins `AGG_DIGEST:u64` across 3 modes and asserts: (a) **direct == in-process == subprocess** GKZK1 bytes
+(the headline cross-PROCESS witness, analog of Phase-8 `REF_STREAM_DIGEST`); (b) 3-shard real-worker merge == unsharded ==
+direct, AND a REVERSE-order `mergeAggregates` gives the identical pin (order-independence); (c) a `--crash` worker is harvested as
+`Defect` with `term .signal` and `repro_job` == the dispatched job, parent survives, other shards' merge unaffected, AND a
+`--hang` worker hits `error.Timeout` and is killed+reaped; (d) qserver GKZR1 bytes == `respond()` called directly. **Honesty is
+STRUCTURAL** (the Phase-8 lesson): a disguised in-process gate CANNOT produce a real `Term.signal` (an in-process `@panic` aborts
+the gate's own test binary) or a real kill-on-timeout, and B_sub must come from a child's stdout whose exe path was injected via
+`getEmittedBin`. `SpawnError`→`SkipZigTest` (honest, never a silent in-process fallback). **build.zig** adds (Linux-guarded, per
+mode) a `gkz_worker_{mode}` exe with `addOptionPath("worker_exe_path", getEmittedBin())` + a `proc-gate-{mode}` test artifact
+(`has_side_effects=true`); NO `link_libc`/`pie=false` needed (std.process spawn, unlike dlopen, needs neither). The in-process
+Executor/QueryTransport equality tests live in the BASE suite and run everywhere.
+
+**Module build order:** `job.zig` → `worker_example/shared.zig` → `executor.zig` → `worker_main.zig` (+ a `worker` subcommand in
+`main.zig`) → `supervisor.zig` → `qserver.zig` → `proc_gate.zig` → build.zig wiring → root.zig exports. **Deferred behind the
+seam:** multi-MACHINE distribution (a `NetworkExecutor` shipping the same frames), parallel `Io.async` dispatch (merge-by-index
+makes it a drop-in), the `.fork` arm proven end-to-end through the subprocess gate (codec+transport support it; only `sweep_shard`
+is pinned cross-process), a real network protocol + auth/TLS, restart backoff/health policy, a persistent long-lived worker pool,
+the higher-level AI control-plane verbs + the reload/migrate TRIGGER (reload.zig:21-24), stdin-pipe job delivery, and Windows/macOS
+validation.
+
+### Phase 9 review notes (adversarial judge-panel: 5 dimensions → adversarial verify → triage)
+
+5 reviewers (process-lifecycle, determinism-honesty, codec-hostile, memory-ownership, zig-idiom-build); every
+finding adversarially re-checked against the code. **14 confirmed/partial, 0 false positives.** Fixes:
+- **[MEDIUM] crash-isolation gap (supervisor.zig):** a worker that exited 0 with a length-valid but
+  MALFORMED GKZK1 body (a version/R-mismatched exe, a `.final` for a sweep, a garbage payload) propagated a
+  `serialize.Error` straight out of `runJobs`, aborting the WHOLE sweep — violating §13 isolation. Fixed:
+  the `.ok` arm now routes a decode failure / wrong-arm result through the SAME restart/defect path as a
+  crash (a new `ChildTerm.bad_result`); one bad worker becomes a per-shard `Defect=repro` and its siblings
+  still merge. Covered by a new unit test (a mock executor returning `.ok` + garbage → two defects, empty
+  merge, no abort).
+- **[MEDIUM] honesty false-skip (executor.zig):** the subprocess `run()` catch mapped EVERY non-Timeout/OOM
+  error to `.spawn_failed` → the gate `SkipZigTest`s. So a BROKEN/missing worker-exe path (`FileNotFound`,
+  `InvalidExe`) or a mid-stream read error would SILENTLY skip the entire real cross-process gate, hiding a
+  dead gate. Fixed: only genuine spawn-denial/resource-exhaustion (`AccessDenied`/`PermissionDenied`/
+  `OperationUnsupported`/`SystemResources`/fd-quota) → `.spawn_failed`; `StreamTooLong` (runaway worker) →
+  `.crashed`; everything else → `error.WorkerProtocol` (a HARD failure, never a silent skip).
+- **[MEDIUM] dead/broken code (qserver.zig):** `serveUnixOnce` used non-existent reader/writer APIs and
+  would not compile if instantiated (it never was, so it slipped through). Deleted it — the socket
+  accept-loop is now an honestly-documented deferred control-plane seam; the gate still proves the Unix
+  socket binds+connects and that `handle()` (the multiplexing substance) matches `respond()` byte-for-byte.
+- **[LOW] codec hardening (job.zig):** encode-side `@intCast(len)` to `u32` could panic (safe) / truncate
+  (ReleaseFast) on a >4 GiB section — a D2 hazard; now guarded with an explicit `u32Len` check →
+  `error.Corrupt`. `decodeJob`/`decodeResult` now reject trailing garbage after a valid frame
+  (`r.pos != bytes.len` → `Corrupt`).
+- **[LOW] partial-file leak (executor.zig):** `writeJobFile` now has an `errdefer deleteFile` so a failed
+  write/flush leaves no orphaned temp file.
+- **[LOW/NIT] gate + hygiene:** the crash sub-gate now asserts a REAL `.signal` (not `.signal or .exited`,
+  which weakened the SIGABRT-isolation proof an in-process @panic could never produce); the (b) docstring no
+  longer claims a reverse-order merge it doesn't run (that's proven in the supervisor unit test); a
+  `n_workers >= 1` assert; a redundant no-op `catch` simplified to `try`.
+
+**Left as-is (justified):** the worker decodes a (≈20-byte) job twice (poison check + `runJobBytes`) — a
+negligible micro-cost not worth coupling the shared dispatcher to a pre-decoded job; the per-ctx `seq`
+job-file naming is collision-free for the sequential MVP (a future parallel `Io.async` dispatch would need
+an atomic counter — documented).
+
+Gate: **891 tests green** (289 base + 4 reload-gate + 4 proc-gate per Debug/ReleaseSafe/ReleaseFast).

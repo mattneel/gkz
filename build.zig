@@ -105,6 +105,36 @@ pub fn build(b: *std.Build) void {
             const gate_run = b.addRunArtifact(gate_t);
             gate_run.has_side_effects = true;
             test_step.dependOn(&gate_run.step);
+
+            // --- Phase 9: the real §13 process-model gate ---
+            // A dedicated per-mode worker EXE (R pinned via worker_example/shared.zig) the gate spawns;
+            // unlike the dlopen .so this is pure-Zig process spawning, so NO link_libc / pie=false needed.
+            const gkz_worker_mod = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = mode });
+            gkz_worker_mod.addImport("fpz", fpz_mode.module("fpz"));
+            const worker = b.addExecutable(.{ .name = b.fmt("gkz_worker_{s}", .{@tagName(mode)}), .root_module = b.createModule(.{
+                .root_source_file = b.path("src/proc/worker_main.zig"),
+                .target = target,
+                .optimize = mode,
+                .imports = &.{.{ .name = "gkz", .module = gkz_worker_mod }},
+            }) });
+            const proc_opts = b.addOptions();
+            proc_opts.addOptionPath("worker_exe_path", worker.getEmittedBin()); // injects path + build-graph dep
+
+            const gkz_pgate_mod = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = mode });
+            gkz_pgate_mod.addImport("fpz", fpz_mode.module("fpz"));
+            const pgate_mod = b.createModule(.{
+                .root_source_file = b.path("src/proc/proc_gate.zig"),
+                .target = target,
+                .optimize = mode,
+                .imports = &.{
+                    .{ .name = "gkz", .module = gkz_pgate_mod },
+                    .{ .name = "build_opts", .module = proc_opts.createModule() },
+                },
+            });
+            const pgate_t = b.addTest(.{ .name = b.fmt("proc-gate-{s}", .{@tagName(mode)}), .root_module = pgate_mod });
+            const pgate_run = b.addRunArtifact(pgate_t);
+            pgate_run.has_side_effects = true; // never cache-skip a spawn gate
+            test_step.dependOn(&pgate_run.step);
         }
     }
 }

@@ -79,7 +79,10 @@ pub const EventEmitter = simctx.EventEmitter;
 pub const vopr = @import("vopr/vopr.zig");
 pub const Oracle = @import("vopr/oracle.zig").Oracle;
 pub const Defect = @import("vopr/oracle.zig").Defect;
-pub const Generator = @import("vopr/generator.zig").Generator;
+pub const generator = @import("vopr/generator.zig");
+pub const Generator = generator.Generator;
+pub const idleGen = generator.idleGen;
+pub const scriptedGen = generator.scriptedGen;
 pub const sweep = vopr.sweep;
 
 pub const snapshot_mod = @import("snapshot.zig");
@@ -128,6 +131,13 @@ pub const migrateBytes = migrate.migrateBytes;
 pub const migrateWorld = migrate.migrateWorld;
 pub const migrateSnapshot = migrate.migrateSnapshot;
 pub const validateMigration = migrate.validateMigration;
+
+// --- Phase 9: process model & control plane (SPEC §13) ---
+pub const proc = @import("proc.zig");
+pub const Executor = proc.Executor;
+pub const Supervisor = proc.Supervisor;
+pub const QueryServer = proc.QueryServer;
+pub const runWorker = proc.runWorker;
 
 pub const reload = @import("reload.zig");
 pub const SystemSet = reload.SystemSet;
@@ -187,4 +197,5 @@ test {
     _ = agent;
     _ = migrate;
     _ = reload;
+    _ = proc;
 }
