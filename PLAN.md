@@ -4,16 +4,18 @@
 > order** it gets built, and records the architectural decisions made along the way. The primary user
 > is an AI; every decision below favors determinism, legibility, and a tight feedback loop.
 
-Status: **Phases 1–4 implemented; all determinism gates green; adversarial reviews passed.**
+Status: **Phases 1–5 implemented; all determinism gates green; adversarial reviews passed.**
 **Foundation (§1–§3/§6)** + **Systems & scheduler (§4)** + **Events & causality (§5)** + **the VOPR
-(§9)** are complete: **390 tests** across Debug/ReleaseSafe/ReleaseFast — pinned end-to-end +
-per-tick-stream hashes (cross-build bit-identity, D2), an order-permutation gate (execution-order
-independence), an events-OFF==events-ON hash-invariance gate + a pinned event-log digest, the VOPR
-capstone (an injected determinism bug is caught/bisected/minimized/explained; a clean schedule reports
-zero defects), and an `OutOfMemory`-injection sweep that proves the whole VOPR pipeline is leak-/double-
-free-safe. Commits: Phase 1 `a589d39`, Phase 2 `37748cf`, Phase 3 `1a33f29`; Phase 4 lands in this
-commit (adversarial review 16/16 confirmed — two HIGH fixed: provenance now re-anchors at the
-minimized failing tick, and ownership is taken before the first fallible call in `buildRun`/capture).
+(§9)** + **the §7 query surface** are complete: **507 tests** across Debug/ReleaseSafe/ReleaseFast —
+pinned end-to-end + per-tick-stream hashes (cross-build bit-identity, D2), an order-permutation gate
+(execution-order independence), an events-OFF==events-ON hash-invariance gate + a pinned event-log
+digest, the VOPR capstone (an injected determinism bug is caught/bisected/minimized/explained; a clean
+schedule reports zero defects) with an `OutOfMemory`-injection sweep proving the VOPR pipeline leak-
+/double-free-safe, and the §7 query surface with 8 pinned cross-build GKZR1 result digests + a SCRAMBLE
+invariance sub-gate (canonical re-sort severs table/log/exec observation order). Commits: Phase 1
+`a589d39`, Phase 2 `37748cf`, Phase 3 `1a33f29`, Phase 4 `9be50c3`; Phase 5 lands in this commit
+(adversarial review 7/8 confirmed — one HIGH fixed: `readResult` rejects `arity==0`, closing an
+unbounded-allocation DoS on the untrusted control-plane decode path).
 This document is the decision of record. It was produced from a
 3-architecture judge panel (5 independent lenses + synthesis) over ground truth extracted from
 SPEC.md, the `fpz` dependency, and the live Zig 0.16.0 toolchain.
@@ -309,7 +311,7 @@ Phase-1 `deferred_with_seams` provisions, so later phases bolt on without rework
 | *2b. SIMD/archetype upgrade (perf track)* | §3 | swap flat table → archetype tables behind the storage seam; SIMD batch path via `fpz.simd`. Hash/serialize/`step` unchanged. Extend cross-build gate to scalar-vs-SIMD overflow. | **S1** (sealed upgrade) |
 | **3. Events & causality** ✅ | §5 | recording `EventEmitter` threaded through `SimCtx` into a **side** `EventLog` (owned by a `Recorder`, never in the hashed World); structural `EventId` + a **distinct, component-storable `CauseToken`** (storing an `EventId` in a component is a compile error); auto-attributed `SystemCause` nodes + cross-tick `causeTokenHere`/`causeFromToken`; `causesOf`/`causeChain` backward-walk; tiered on/off recording. **Events are hash-invariant** (events-OFF == events-ON, gated). Typed payload decode + the §7 relational surface deferred. | **S3** |
 | **4. VOPR** ✅ | §9 | one `Oracle`/`Defect` abstraction (invariant · divergence; crash/`.trap` deferred to the build-mode/process boundary); seeded pluggable `Generator`; fault/timing injection (within-stage exec permutation + snapshot-cadence round-trip — none may change the per-tick hash) with first-tick bisection; kind-locked delta-debug minimization; provenance re-run (`causeChain`) on a hit; `sweep` a pure function of a seed range (the §13 sharding seam). Capstone: an undeclared-write system is caught/bisected/minimized/explained; the correct twin → zero defects. | reuses step/runScheduled/snapshot/digest/Recorder |
-| **5. Query surface** | §7 | Datalog-ish relations (`component/3`, `event/5`, `caused_by/2`, `system/3`, `diverge/3`) over a socket; reflection from §4 access sets. | **S5** |
+| **5. Query surface** ✅ | §7 | minimalist hand-canonicalized relations (`component/3`, `event/5`, `caused_by/2`, `system/3`, `diverge/3`) + the 4 canonical shapes (Why/What-affects-X/Where-broke/Reachability) over a uniform `Value` substrate; self-describing catalog (`relation_schema`/`relation_column`); reflection from §4 access sets (never drifts); GKZQ1/GKZR1 serializable wire codec (the socket transport is Phase-9/S7). | **S5** |
 | **6. Specs / invariants / properties** | §8 | state invariants; temporal/LTL properties over the trace; intent-metrics over agent runs. | **S8** |
 | **7. Agent harnesses & evaluation** | §10 | `observe(State)->Input` policies (scripted/search/learned); mass faster-than-realtime evaluation; aggregate intent-metrics. NN inference is the *player*, not the *world*. | reuses Input channel |
 | **8. Hot-reload & migration** | §12 | `dlopen`/`dlclose` of native systems (state stays in columns); version-tagged pure `World→World` schema migrations dispatched on `schema_version` + per-Kind fingerprint. | **S6** |
@@ -425,3 +427,79 @@ netcode, asset import, editor) are out of kernel scope (§15) — only their one
     is input-command provenance at the bottom of a chain (shared with Phase 3 note 15). Command-buffer
     apply-timing is *subsumed* by `exec_perm` (the drain is already `(system_id, seq)`-ordered and
     exec-order-independent), documented in `inject.zig`. *(tests#0/#2/#4/#5, zig#1, spec#0/#1/#2.)*
+
+---
+
+## 8. Phase 5 design — the §7 relational query surface (decision of record, from the design judge-panel)
+
+Produced by a 5-architect / 5-lens judge panel (determinism · spec_fidelity · ai_ergonomics · scope_realism ·
+forward_compat) + synthesis. **Spine = the minimalist hand-canonicalized relation surface** (the only design judged
+buildable at prior-phase size *and* highest on determinism: every relation is a hand-written canonical traversal over
+already-certified kernel machinery; recursion delegates verbatim to `event_log.causeChain`; no parser, no general join
+planner, no fixpoint solver). **Rejected as spine:** a real text-Datalog engine (#2 — scope-fatal: parser + stratified-
+negation semi-naive evaluator are net-new no-reuse subsystems, and stratified negation is a determinism hazard) and the
+volcano pull-iterator algebra (#5 — pays Cursor-vtable + borrow-lifetime cost for laziness that materialize-at-boundary
+makes moot). **Four grafts onto the spine** (each flagged by ≥1 lens): (1) a **uniform closed-tag `Value` substrate** —
+fixes #1's fatal ai_ergonomics flaw so every result row is the same machine-parseable value space and the diverge diff +
+GKZR1 codec are one `writeValue` loop; (2) a **self-describing catalog** (`relation_schema`/`relation_column` as
+queryable relations + a comptime producer-vs-meta drift tripwire) so an AI with no source access discovers the surface
+by querying it; (3) the **scramble-invariance sub-gate** — proves the canonical re-sort *severs* observation order
+(Phase-2/3 gate analogue); (4) a **dual-path recursion cross-check** (`why`-via-generic-walk == `causeChain`).
+
+**Modules (`src/query/`), in build order:** `term.zig` (the `Value` union + total `Value.order`/`tupleOrder` + named
+`Schema`/`Row`/`RelId`/`BytesRef`); `result.zig` (`QueryResult` + `Builder` with errdefer cleanup + `finalize` canonical-
+sort/dedup + `resultDigest`); `relations.zig` (the five producers over borrowed `*const World`/`*const EventLog`/comptime
+`Schedule`: `component/3` via `Table.canonicalOrder`+`writeValue`, `event/5` re-sorted by `EventId.order`, `caused_by`
++`whyChain` delegating to `causeChain`, `system/3` comptime from `Sys(R).access` via `R.sorted`/`kindId`, +
+`whatWrites`/`whatReads` mask-scans); `catalog.zig` (comptime `RelMeta` → the two catalog relations + the drift assert);
+`diverge.zig` (component-level `diverge/3` = `firstDivergentTick` bisect → `worldAt(t)` both runs → canonical
+`(entity.index,kind_id)` component-byte diff; `firstTickWhere` reusing `oracle.invariant`'s predicate shape; generic
+`reach()` fixpoint over an exogenous adjacency relation); `wire.zig` (GKZQ1 query + GKZR1 result codecs reusing
+`serialize.ByteSink`/`ByteReader`/`writeValue`, magic+version header, readLog-style validate-before-alloc, never panic;
+the `respond(bytes,gpa,env,*ByteSink)` S7 seam, zero io); `query.zig` (the `Query(R)` tagged union + `Engine(R)` +
+exhaustive `evaluate` switch); `gate.zig` (the cross-build gate + pinned per-relation/-shape/-catalog GKZR1 digests + the
+5 sub-gates). Covers all five relations and all four canonical shapes (Why/What-affects-X/Where-broke/Reachability).
+
+**Phase-5 gate:** all 3 build modes assert the SAME pinned GKZR1 `resultDigest` constants (D2/D5), plus five mechanism
+sub-gates: SCRAMBLE invariance (churn table layout + permute exec order + shuffle log order → digests unchanged);
+comptime `system/3` reflection-exactness (reflected masks == independently recomputed `Access`); dual-path
+`why==causeChain`; GKZQ1/GKZR1 wire round-trip identity + hostile-input rejection (never panic); OOM-injection leak-
+freedom. **Deferred behind seams:** socket transport / live-sim server (S7, Phase 9 — `respond` is a pure bytes→bytes
+handler, engine borrows by const pointer); textual Datalog parser (S5-text — `Query(R)` is the serializable language; a
+future `parse([]u8)->Query(R)` bolts on); invariant/LTL semantics for Where-broke (S8, Phase 6 — `firstTickWhere` takes
+the opaque predicate); the exogenous reachability adjacency relation (S8/S5, Phase 7 — `reach()` takes it as a param);
+typed event-payload decode (S5 — payload stays canonical bytes tagged with `kind_id`; a comptime `decodeValue` is a non-
+breaking add); runtime relation registration / general join / aggregation (S5 — a future relation is a new arm+producer
++catalog entry+pinned digest, additive-by-recompile). `diverge`/`reach`/`first_tick_where` Query arms carry in-process
+pointers (Run/pred/adjacency) → wire-encoded as Phase-9-resolved handles, real pointers in in-process tests.
+
+### Phase 5 notes (from the Phase-5 adversarial review — 7/8 confirmed, one HIGH fixed, rest fixed/documented)
+
+18. **`readResult` rejects `arity==0`** (HIGH, fixed). A 14-byte hostile GKZR1 frame with `arity=0` and
+    `row_count=0xFFFFFFFF` drove an unbounded (~824 GB) allocation: with zero cells per row the per-cell
+    bounds-checked-reader advance never fires, so the decoder pushed billions of empty rows before
+    `OutOfMemory`. Every real relation has arity ≥ 2 (the catalog asserts it), so the guard is now
+    `if (arity == 0 or arity > MAX_ARITY) return error.Corrupt;` — a fail-fast on the untrusted §13
+    control-plane decode path. Regression: the arity-0 huge-`row_count` frame now returns `Corrupt`.
+    *(hostile#0.)*
+19. **`diverge/3` empty-result semantics made precise** (fixed/documented). diverge/3 locates COMPONENT-CELL
+    divergences; it returns empty in three cases — runs never diverge, length-only divergence, OR the first
+    hash-divergent tick differs only in non-component World state (entity-allocator generation/free-queue,
+    tick, rng_root), which has no `(entity, kind)` cell. The hash-level `firstDivergentTick` always detects
+    *existence*. Docstring corrected + a regression test (an extra bare entity diverges the allocator/hash
+    but yields an empty diverge/3 while `firstDivergentTick != null`). A structural/allocator-level diff is
+    a deferred enhancement. *(ce#0 / spec#0.)*
+20. **Gate sub-gates hardened** (fixed). (a) The component SCRAMBLE twin was vacuous — both despawn orders
+    converged to the same physical layout; replaced with a genuine layout scramble (a component-less
+    throwaway kept live vs. despawned, which swap-relocates a content row while the relation stays
+    identical), asserting equal digests across differing `rowCount`. (b) The OOM-injection battery now
+    includes `firstTickWhere` + `reach` (previously omitted despite the "whole query battery" claim). (c)
+    The battery now exercises the GKZQ1 query codec (write→read→evaluate), not only GKZR1. (d) The
+    `system/3` reflection-exactness oracle recomputes expected kind lists via a DIFFERENT primitive
+    (iterating component types + `bitOf` + insertion sort) instead of the producer's `R.sorted[p]` loop, so
+    it is no longer circular. *(tests#0/#1/#2/#4.)*
+
+Bonus catches fixed during implementation (before review): a `buildForks` double-free (an `errdefer` on a
+world that `buildRun` consumes) surfaced by the OOM sub-gate, and a dangling column-name borrow in
+`readResult` (decoded `schema.names` borrowed the caller's reader buffer) — names are now owned in the
+result's arena.

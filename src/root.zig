@@ -90,6 +90,22 @@ pub const restore = snapshot_mod.restore;
 pub const replay_mod = @import("replay.zig");
 pub const replay = replay_mod.replay;
 
+// --- Phase 5: introspection & relational query surface (SPEC §7) ---
+pub const query_term = @import("query/term.zig");
+pub const Value = query_term.Value;
+pub const RelId = query_term.RelId;
+pub const query_result = @import("query/result.zig");
+pub const QueryResult = query_result.QueryResult;
+pub const query_relations = @import("query/relations.zig");
+pub const query_catalog = @import("query/catalog.zig");
+pub const query_diverge = @import("query/diverge.zig");
+pub const query_engine = @import("query/engine.zig");
+pub const QueryEngine = query_engine.Engine;
+pub const QuerySurface = query_engine.Query; // the wire-serializable request vocabulary
+pub const reach = query_engine.reach;
+pub const query_wire = @import("query/wire.zig");
+pub const query_gate = @import("query/gate.zig");
+
 /// Bring-up placeholder so the scaffold `main.zig` keeps compiling during Phase 1. Replaced by a real
 /// kernel demo once `step`/`snapshot`/`replay` land.
 pub fn printAnotherMessage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -124,4 +140,12 @@ test {
     _ = @import("vopr/oracle.zig");
     _ = @import("vopr/minimize.zig");
     _ = vopr;
+    _ = query_term;
+    _ = query_result;
+    _ = query_relations;
+    _ = query_catalog;
+    _ = query_diverge;
+    _ = query_engine;
+    _ = query_wire;
+    _ = query_gate;
 }
