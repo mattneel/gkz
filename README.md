@@ -52,17 +52,18 @@ zig build run      # build and run the CLI
 zig build          # build the CLI to zig-out/bin/gkz
 ```
 
-`zig build test` is the determinism gate: it runs **693 tests in all three optimize modes** and pins a
+`zig build test` is the determinism gate: it runs **822 tests in all three optimize modes** and pins a
 suite of digests — an end-to-end content hash, a per-tick hash-stream digest, an event-log digest, the
-VOPR's frozen replay constants, the eight query-result digests, and the violation/spec/metric digests —
-asserted identically in every mode. All three modes passing *proves* `Debug == ReleaseSafe ==
+VOPR's frozen replay constants, the eight query-result digests, the violation/spec/metric digests, and a
+frozen v1 migration image + migrated-World digests + reload-stream digest — asserted identically in every
+mode. All three modes passing *proves* `Debug == ReleaseSafe ==
 ReleaseFast` bit-identity: under integer overflow (which ReleaseFast does not trap), across permuted
 system execution order, whether or not events are recorded, regardless of physical table/log layout, and
 with invariant checks compiled in or out.
 
 ---
 
-## What's implemented (Phases 1–7)
+## What's implemented (Phases 1–8)
 
 The world is fully playable, testable, fuzzable, queryable, checkable, and agent-evaluable with **zero
 art** — abstract placeholders only.
@@ -176,6 +177,28 @@ observation and emits inputs; it never touches the integer-deterministic sim pat
 give bit-reproducible sweeps; NN policies give run-level nondeterminism (fine for statistical metrics,
 captured per run to revisit).
 
+### Phase 8 — Hot-reload & schema migration (SPEC §12)
+
+| Module | Responsibility |
+|---|---|
+| `migrate/image.zig` | the schema-agnostic record substrate: `decode` lifts ANY serialize image into per-row `(entity, mask, [{kind_id, raw bytes}])` records using only the image's own per-Kind fingerprint (which carries each kind's byte width) — no old `Registry` types; `encode(R_target)` re-emits bytes byte-identical to `writeWorld` |
+| `migrate/fingerprint.zig` · `migrate/ops.zig` | fingerprint extract/compare/`diff`/`requireMatch`; the declared `Op` vocabulary (`drop`/`add`/`rename`/`transform`) + `FieldBuilder`/`FieldReader` leaf codecs |
+| `migrate/migrate.zig` | `validateMigration` (ops must exactly cover the fingerprint delta), `apply` (folds ops, recomputes masks, asserts the target fingerprint), `Chain`, and `migrateBytes`/`migrateWorld`/`migrateSnapshot` |
+| `reload.zig` | hot-reload as a comptime system-set swap: `SystemSet`/`reloadAt` (a World no-op), `SystemSource` (`inProcessSource` built; `NativeLibSource` a typed stub) |
+
+A migration **never instantiates the old registry** — it decodes a serialized World into a schema-agnostic
+record `Image`, applies a list of **declared, validated ops** (add a field with a default, drop a kind,
+rename, transform a value), and re-emits bytes that are **canonical by construction** (only whole
+canonical-LE slices move; the result is byte-identical to what `writeWorld` would produce, so D5/D7/D8 fall
+out). `validateMigration` proves the ops *exactly* reconcile the per-Kind fingerprint delta **before any byte
+moves**; `apply` asserts the produced schema equals the declared target. The gate freezes a real v1 image and
+proves migrated-v1 **== natively-built v2**, chain v1→v2→v3 **== direct v1→v3 == native v3**, and purity —
+all pinned across the three optimize modes. **Hot-reload** reduces to running a *different* `comptime systems`
+slice over the same World at a tick boundary (the World owns no function pointers, so this adds **zero**
+step-path code): a reload-to-the-same set is a bit-identical hash stream, and a divergent reload is caught by
+the VOPR's divergence oracle — the kernel can't prove opaque reloaded code deterministic (§15 trusts the
+author), but it **detects** a bad reload.
+
 ### Determinism contract (the spine)
 
 `step` is pure; the World is a value; all randomness is a keyed, counter-based pure function; the
@@ -187,7 +210,7 @@ raw memory, never hash-map order, never pointers, always little-endian). These r
 
 ## Roadmap
 
-Phases 1–6 are done. Later phases bolt onto clean seams without reworking the storage/serialize/hash
+Phases 1–8 are done. Later phases bolt onto clean seams without reworking the storage/serialize/hash
 contract:
 
 - **Phase 1** — Foundation ✅
@@ -197,8 +220,8 @@ contract:
 - **Phase 5** — Introspection & relational query surface (§7) ✅
 - **Phase 6** — Specifications, invariants & properties (§8) ✅
 - **Phase 7** — Agent harnesses & evaluation (§10) ✅
-- **Phase 8** — Hot-reload & migration (§12): `dlopen` native systems, version-tagged `World→World` migrations ← *next*
-- **Phase 9+** — Process model & control plane (§13): supervisor pool, the query server, cross-process sweep sharding
+- **Phase 8** — Hot-reload & schema migration (§12): comptime system-set swap, version-tagged `World→World` migrations ✅
+- **Phase 9+** — Process model & control plane (§13): supervisor pool, the query server, cross-process sweep sharding ← *next* (the real `dlopen` native-systems loader + a watch-driven reload trigger plug into Phase 8's `SystemSource` seam here)
 - **Phase 2b** — real thread-pool execution (the scheduler architecture already makes it safe)
 
 See [`PLAN.md`](./PLAN.md) §6 for the full phase map.

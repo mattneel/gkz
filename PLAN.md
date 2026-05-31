@@ -662,3 +662,87 @@ forward FUZZ (each seed = a fresh captured playthrough, then minimize operates o
 route on `DeterminismClass`) — intentional: sweeping a `.external` agent is the valid fuzz-N-playthroughs
 mode; debugging a SPECIFIC captured run uses `asAgent(run)` (`.replay`), and minimize/provenance never
 re-invoke either way.
+
+---
+
+## 11. Phase 8 design — §12 hot-reload & migration (decision of record, from the design judge-panel)
+
+5-architect / 5-lens judge panel + synthesis. **Spine = the schema-agnostic record substrate** (migration) +
+**run-a-different-comptime-`systems`-slice** (hot-reload) — the determinism-cleanest, most scope-realistic pairing
+(determinism 92, scope_realism 86, spec_fidelity 88; the dominant winner). A migration NEVER instantiates an old
+`Registry` type: it decodes any serialize image into a schema-agnostic `Image` (per-row `(entity, mask, [{kind_id, raw
+value-bytes}])` records), driven by the image's OWN per-Kind fingerprint — `serialize.writeWorld` already emits a
+`{kind_id:u16, size:u32}` per-Kind fingerprint (lines 187-191), and that `size` column is exactly each component's
+byte width, so `decode` splits an unknown row BLINDLY by mask-bit rank with zero comptime type knowledge. Migrated
+output is canonically serializable BY CONSTRUCTION (only whole canonical-LE slices move; D5/D7 fall out), terminating
+in the existing `readWorld`/`SchemaMismatch`. **Grafts:** (1) `validateMigration` (from the declarative designs) — a
+pre-apply structural check that the declared ops EXACTLY cover the per-Kind fingerprint delta (`MigrationIncomplete`/
+`MigrationSpurious`/`BadDefaultWidth`), turning "the ops happen to produce a conformant image" into "the ops are the
+proven complete, non-spurious reconciliation BEFORE any byte moves" — the §12 "declared" discipline. (2) A SEPARATE
+pinned raw-image XXH64 (`MIGRATED_IMAGE_BYTES`) alongside the migrated-World digest — catches a non-canonical encode
+that happens to World-hash-collide (the spine's top risk). (3) The §7-catalog surfacing of migrations
+(`migration/3`+`migration_op/4`) as an OPTIONAL adapter (the ai_ergonomics winner's idea, kept off the determinism
+core + out of the gate). **Rejected:** typed versioned registries (keeps every `R_vN` forever; can't decode a snapshot
+whose types were deleted — fails the live-evolution mandate; ai_ergonomics-fatal); a runtime invoke table read by a
+new `stepTable` (puts runtime indirection on the determinism-critical step path to optimize the LESS-load-bearing
+pillar); runtime `exec_order` recompute at swap (a greedy-first-fit drift hazard — with comptime `systems` the order
+is already correct).
+
+**Migration model:** `Migration{from_version, to_version, ops: []const Op, target_fingerprint}` where `Op =
+union{identity, drop_kind, add_kind{kind_id, default_bytes}, rename_kind{from,to}, transform_kind{kind_id, new_size,
+rewrite: fn([]const u8, *FieldBuilder)}}` (the §12 add-field→default / remove→drop / rename→map vocabulary; transforms
+speak a `FieldBuilder` leaf vocabulary, never raw byte math — structurally float/pointer-free). Dispatch on
+`schema_version` first, per-Kind fingerprint second. `Chain{migrations}` folds left-to-right with a
+`from_version==running` gate (a gap is `SchemaMismatch`). **Hot-reload:** `SystemSet(R)` wraps a comptime `[]const
+Sys(R)`; `reloadAt` is a World NO-OP returning the next set (running a different comptime slice on the same World at a
+tick boundary — `step`/`runScheduled` already take comptime `systems` + the World owns zero fn-pointers, so this adds
+ZERO step-path code); `SystemSource(R){loadFn,unloadFn}` with an `inProcessSource` impl built+tested and a
+`NativeLibSource` typed `error.NotImplemented` stub. Reload-to-same is a HARD bit-identity gate (`captureStream` +
+`streamDigest` equality); a diverging reloaded set is caught by `oracle.divergence` (the kernel DETECTS a bad reload —
+it cannot prove opaque native code deterministic, §15 trusts the author).
+
+**Modules (`src/migrate/` + `src/reload.zig`), build order:** `image.zig` (decode/encode = the record-layer inverse
+of serialize; **prove the identity round-trip first**); `fingerprint.zig` (extract/compare + `requireMatch`→
+`SchemaMismatch`); `ops.zig` (the Op union + `FieldBuilder`/`FieldReader`); `migrate.zig` (`validateMigration` then
+`apply` then `Chain`/`migrateBytes`/`migrateSnapshot`); `reload.zig` (`SystemSet`/`reloadAt`/`SystemSource`); `gate.zig`
+(pinned `PINNED_V1` blob + `EXPECTED_V2/V3_HASH` + `MIGRATED_IMAGE_BYTES`); `root.zig` wiring; `catalog.zig` (optional,
+last). **Phase-8 gate:** migrated-v1 == native-v2 (digest AND a separately native-built v2 + the raw-image XXH64),
+chain==direct==native-v3, fingerprint dispatch + `validateMigration` rejection (incomplete/spurious/bad-width/identity),
+purity (migrate twice == same bytes), reload bit-identity + a diverging reload caught by the VOPR, OOM-injection — all
+pinned across the 3-mode matrix. **Deferred behind seams:** the real `dlopen` loader + shared-object build rule
+(`SystemSource.loadFn`; `NativeLibSource` stub), the Phase-9 control plane triggering reloads/migrations, allocator/rng
++ cross-entity + filtered-add migrations (a future Op arm on the same union), EventLog/relation-schema migration.
+
+### Phase 8 review notes (adversarial judge-panel: 5 dimensions → adversarial verify → triage)
+
+5 reviewers (determinism/memory, hostile-input, migration-correctness, spec-fidelity, Zig-idiom); every raw
+finding was adversarially re-checked against the code before reaching triage. **8 confirmed/partial, 0
+survived as false positives.** Fixes applied:
+- **[MEDIUM] `image.encode` shared-kind width guard** — encode trusted that each cell's bytes matched
+  `R_target`'s width; a shared `kind_id` with a mismatched width (e.g. encoding into the wrong `R_target`)
+  silently produced a corrupt stream. Added a comptime-driven guard at the top of `encode`: for every kind
+  `R_target` expects that the image also carries, the canonical widths must agree else `SchemaMismatch`.
+  Missing/extra kinds remain fine (dropped / bit unset), so the legitimate "encode into a different schema"
+  path is unaffected. Makes "canonical by construction" total. Covered by a new test.
+- **[LOW] `validateMigration` per-op independence documented** — validate checks each op against
+  `(old_fp, target)` independently while `apply` folds sequentially, so a rename-then-resize of the SAME kind
+  inside one `Migration` is (correctly, safely) over-rejected; it must be split across `Chain` links. validate
+  only ever over-rejects, never wrongly accepts. Documented on `validateMigration` + the constraint.
+- **[LOW] gate second pin made genuinely independent** — `MIGRATED_IMAGE_BYTES` (XXH64 of the bytes) was
+  tautological with `EXPECTED_V2_HASH` (the World digest IS the XXH64 of the canonical bytes — the D5
+  guarantee). Replaced with `MIGRATED_IMAGE_CRC32` (a separate hash FAMILY), so a non-canonical encode that
+  XXH64-collided would still be caught; the byte-identity assertion remains the primary canonicality proof.
+- **[LOW/NITs] gate (e) now exercises the reload SURFACE** — obtains the post-swap set via
+  `reloadAt` + `inProcessSource(...).load()` (asserting it wraps the comptime slice), adds a reload-to-DIFFERENT
+  case (`reload_a`→`reload_b`) caught by `oracle.firstDivergentTick` with an identical pre-swap prefix, and
+  removed the unused `Op` alias. The previously-unused `reload_b`/`bumpD2`/`oracle` are now load-bearing.
+- **[NIT] hostile-input** — the bounded (input-proportional, ~constant-factor) all-size-0 cell amplification
+  in `decode` is within the validate-before-alloc contract (size-0 is legitimate for field-less tags); noted
+  in a comment, no functional change. decode still never panics and never pre-allocs on an unjustified count.
+
+**Deferred (deliberate):** the optional §7 `migration/3` + `migration_op/4` catalog adapter — implementing it
+would force re-pinning Phase-5 `QUERY_SCHEMA_DIGEST`/`QUERY_COLUMN_DIGEST` for a non-determinism-bearing
+feature, coupling Phase 8 to Phase 5's gate. Migrations are already inspectable as data (`Migration{name, ops,
+target_fingerprint}`); the adapter plugs in later behind the existing `RelId`/`CATALOG` seam.
+
+Gate: **822 tests green across Debug/ReleaseSafe/ReleaseFast** (274/mode + the skipped pin-recompute dump).

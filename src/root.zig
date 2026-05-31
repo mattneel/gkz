@@ -120,6 +120,20 @@ pub const DeterminismClass = agent.DeterminismClass;
 pub const ObsView = agent.ObsView;
 pub const ExternalAgent = agent.ExternalAgent;
 
+// --- Phase 8: schema migration & hot-reload (SPEC §12) ---
+pub const migrate = @import("migrate.zig");
+pub const Migration = migrate.Migration;
+pub const Chain = migrate.Chain;
+pub const migrateBytes = migrate.migrateBytes;
+pub const migrateWorld = migrate.migrateWorld;
+pub const migrateSnapshot = migrate.migrateSnapshot;
+pub const validateMigration = migrate.validateMigration;
+
+pub const reload = @import("reload.zig");
+pub const SystemSet = reload.SystemSet;
+pub const SystemSource = reload.SystemSource;
+pub const reloadAt = reload.reloadAt;
+
 /// Bring-up placeholder so the scaffold `main.zig` keeps compiling during Phase 1. Replaced by a real
 /// kernel demo once `step`/`snapshot`/`replay` land.
 pub fn printAnotherMessage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -164,4 +178,6 @@ test {
     _ = query_gate;
     _ = spec;
     _ = agent;
+    _ = migrate;
+    _ = reload;
 }
