@@ -26,8 +26,13 @@ pub fn Supervisor(comptime T: type) type {
 
         gpa: Allocator,
         executor: exe.Executor,
-        /// Concurrency cap (MVP dispatches sequentially; parallel is a deferred drop-in). Bounded ≥ 1.
+        /// Concurrency cap. With `io != null` and `n_workers > 1`, shards dispatch in PARALLEL via an
+        /// `Io.Group` (real across-cores throughput, §13); otherwise sequentially. The merged result is
+        /// identical either way (merge-by-shard-index is order-independent). Bounded ≥ 1.
         n_workers: usize = 1,
+        /// Required for parallel dispatch (the `Io.Group`); null ⇒ sequential. The subprocess executor's
+        /// own `io` (in its ctx) is separate — this is the supervisor's concurrency io.
+        io: ?std.Io = null,
         /// How many times a crashed shard is re-dispatched before it is permanently failed (its repro
         /// retained). A deterministic crash reproduces (keeps crashing) → bounded, no infinite loop.
         max_restarts: u32 = 2,
@@ -56,79 +61,87 @@ pub fn Supervisor(comptime T: type) type {
             }
         };
 
-        /// Dispatch a caller-supplied list of shard jobs (in shard-index order: `jobs[i].shard_i == i`),
-        /// harvesting each into an index-addressed slot, restarting crashes, and merging survivors in
-        /// canonical order. The gate uses this to inject a poison shard; `runSweep` is the normal sugar.
-        pub fn runJobs(self: *Self, jobs: []const ShardJob) !SweepResult {
-            std.debug.assert(self.n_workers >= 1); // advisory in the MVP (sequential dispatch); ≥1 by contract
-            const results = try self.gpa.alloc(?metric.Aggregate(T), jobs.len);
-            defer self.gpa.free(results);
-            @memset(results, null);
+        /// One shard's resolved outcome, written into an index-addressed slot. A parallel task touches ONLY
+        /// its own slot (distinct address), so there is no shared-state race; the supervisor assembles the
+        /// merged result + defect set from the slots AFTER the join, in canonical shard-index order.
+        const ShardOutcome = union(enum) {
+            pending,
+            ok: metric.Aggregate(T),
+            fault: exe.ChildTerm, // permanently failed after restarts
+            spawn_denied,
+            failed: exe.RunError, // a hard error (OOM etc.) — propagated, never silently skipped
+        };
 
+        /// Run one shard to a terminal `ShardOutcome` (its own retry loop). Free-standing so an `Io.Group`
+        /// can dispatch it; it never mutates shared state (only `slot`).
+        fn resolveShard(executor: exe.Executor, gpa: Allocator, max_restarts: u32, job_bytes: []const u8, slot: *ShardOutcome) void {
+            slot.* = resolveOne(executor, gpa, max_restarts, job_bytes) catch |e| .{ .failed = e };
+        }
+        fn resolveOne(executor: exe.Executor, gpa: Allocator, max_restarts: u32, job_bytes: []const u8) exe.RunError!ShardOutcome {
+            var attempt: u32 = 0;
+            while (true) : (attempt += 1) {
+                var out: std.ArrayList(u8) = .empty;
+                defer out.deinit(gpa);
+                var osink = serialize.ByteSink{ .list = &out, .gpa = gpa };
+                const outcome = try executor.run(gpa, job_bytes, &osink);
+                // success → .ok; a malformed/wrong-arm exit-0 result is a per-shard protocol fault
+                // (.bad_result), routed through the SAME restart path as a crash (§13 isolation).
+                const fault: exe.ChildTerm = switch (outcome) {
+                    .ok => blk: {
+                        if (job.decodeResult(T, gpa, out.items)) |dv| {
+                            var dec = dv;
+                            defer dec.deinit();
+                            switch (dec.result) {
+                                .aggregate => |x| return .{ .ok = x.agg },
+                                .final => {}, // a fork result for a sweep job → protocol fault
+                            }
+                        } else |_| {} // malformed result frame → protocol fault
+                        break :blk .bad_result;
+                    },
+                    .spawn_failed => return .spawn_denied,
+                    .crashed => |term| term,
+                };
+                if (attempt >= max_restarts) return .{ .fault = fault };
+                // else re-dispatch the SAME job (a transient fault may recover; a deterministic one re-faults)
+            }
+        }
+
+        /// Dispatch a caller-supplied list of shard jobs (in shard-index order: `jobs[i].shard_i == i`),
+        /// each into an index-addressed slot (PARALLEL via `Io.Group` when `io != null` and `n_workers > 1`,
+        /// else sequential), then assemble the merged Aggregate + defect set in canonical order. The result
+        /// is identical regardless of dispatch order/parallelism — the §4 principle, across processes.
+        pub fn runJobs(self: *Self, jobs: []const ShardJob) !SweepResult {
+            std.debug.assert(self.n_workers >= 1);
+            const slots = try self.gpa.alloc(ShardOutcome, jobs.len);
+            defer self.gpa.free(slots);
+            @memset(slots, .pending);
+
+            if (self.io != null and self.n_workers > 1 and jobs.len > 1) {
+                var group: std.Io.Group = .init;
+                for (jobs, 0..) |sj, i| group.async(self.io.?, resolveShard, .{ self.executor, self.gpa, self.max_restarts, sj.bytes, &slots[i] });
+                group.await(self.io.?) catch {}; // every task has written its slot; assembly is below
+            } else {
+                for (jobs, 0..) |sj, i| resolveShard(self.executor, self.gpa, self.max_restarts, sj.bytes, &slots[i]);
+            }
+
+            // assemble in shard-index order — all parallel writes are done, so this is race-free + canonical.
             var defects: std.ArrayList(Defect) = .empty;
             errdefer {
                 for (defects.items) |d| self.gpa.free(d.repro_job);
                 defects.deinit(self.gpa);
             }
-            var spawn_denied = false;
-
-            for (jobs, 0..) |sj, slot| {
-                var attempt: u32 = 0;
-                dispatch: while (true) : (attempt += 1) {
-                    var out: std.ArrayList(u8) = .empty;
-                    defer out.deinit(self.gpa);
-                    var osink = serialize.ByteSink{ .list = &out, .gpa = self.gpa };
-                    const outcome = try self.executor.run(self.gpa, sj.bytes, &osink);
-
-                    // Resolve to either success (results[slot] set, break) or a FAULT term to harvest. A
-                    // worker that exits 0 with a malformed / wrong-arm result frame is a per-shard protocol
-                    // fault (.bad_result) routed through the SAME restart/defect path as a crash — one bad
-                    // worker never aborts the whole sweep (§13 crash-isolation).
-                    const fault: exe.ChildTerm = switch (outcome) {
-                        .ok => blk: {
-                            if (job.decodeResult(T, self.gpa, out.items)) |dv| {
-                                var dec = dv;
-                                defer dec.deinit();
-                                switch (dec.result) {
-                                    .aggregate => |x| {
-                                        results[slot] = x.agg;
-                                        break :dispatch; // success
-                                    },
-                                    .final => {}, // a fork result for a sweep job → protocol fault
-                                }
-                            } else |_| {} // a malformed result frame → protocol fault
-                            break :blk .bad_result;
-                        },
-                        .spawn_failed => {
-                            spawn_denied = true;
-                            break :dispatch; // genuine spawn-denial; the gate SkipZigTests
-                        },
-                        .crashed => |term| term,
-                    };
-
-                    // a fault (crash / timeout / bad_result): retry up to max_restarts, else harvest a
-                    // Defect=repro and exclude the shard (its siblings still merge by index).
-                    if (attempt >= self.max_restarts) {
-                        try defects.append(self.gpa, .{
-                            .shard_i = sj.shard_i,
-                            .range = sj.range,
-                            .term = fault,
-                            .repro_job = try self.gpa.dupe(u8, sj.bytes),
-                        });
-                        break :dispatch;
-                    } // else re-dispatch the SAME job (a transient fault may recover; a deterministic one re-faults)
-                }
-            }
-
-            // merge survivors in canonical shard-index order (results is index-addressed, so iterating it
-            // ascending is canonical; mergeAggregates is associative + order-independent regardless).
             var parts: std.ArrayList(metric.Aggregate(T)) = .empty;
             defer parts.deinit(self.gpa);
-            for (results) |maybe| if (maybe) |a| try parts.append(self.gpa, a);
-            const merged = shard.mergeAggregates(T, parts.items);
+            var spawn_denied = false;
+            for (jobs, 0..) |sj, i| switch (slots[i]) {
+                .ok => |agg| try parts.append(self.gpa, agg),
+                .fault => |term| try defects.append(self.gpa, .{ .shard_i = sj.shard_i, .range = sj.range, .term = term, .repro_job = try self.gpa.dupe(u8, sj.bytes) }),
+                .spawn_denied => spawn_denied = true,
+                .failed => |e| return e, // a hard error (OOM etc.) — propagate, never a silent skip
+                .pending => unreachable,
+            };
 
-            // defects are appended in shard order already (we iterate jobs ascending); a sort keeps the
-            // contract explicit even if a future parallel dispatch appends out of order.
+            const merged = shard.mergeAggregates(T, parts.items); // associative + canonical order
             const def_slice = try defects.toOwnedSlice(self.gpa);
             std.mem.sort(Defect, def_slice, {}, lessDefect);
             return .{ .agg = merged, .defects = def_slice, .spawn_denied = spawn_denied };
@@ -257,6 +270,22 @@ test "a worker that returns a malformed result is harvested as a per-shard defec
     try testing.expectEqual(exe.ChildTerm.bad_result, res.defects[0].term);
     try testing.expect(res.defects[0].repro_job.len > 0); // the repro is retained
     try testing.expectEqual(@as(u64, 0), res.agg.count); // no survivor merged
+}
+
+test "PARALLEL in-process dispatch (Io.Group) yields the identical Aggregate as sequential" {
+    const gpa = testing.allocator;
+    const io = std.testing.io;
+    // parallel: 4 shards concurrently over the in-process executor
+    var par = Supervisor(u64){ .gpa = gpa, .executor = exe.inProcessExecutor(TestSpec), .io = io, .n_workers = 4 };
+    var rp = try par.runSweep(0, 6, 4, 8, 0);
+    defer rp.deinit(gpa);
+    // sequential: same range, no io
+    var seqv = Supervisor(u64){ .gpa = gpa, .executor = exe.inProcessExecutor(TestSpec), .n_workers = 1 };
+    var rs = try seqv.runSweep(0, 6, 4, 8, 0);
+    defer rs.deinit(gpa);
+    try testing.expectEqual(rs.agg.sum, rp.agg.sum); // parallel == sequential, bit for bit
+    try testing.expectEqual(rs.agg.count, rp.agg.count);
+    try testing.expectEqual(@as(usize, 0), rp.defects.len);
 }
 
 test "merge is order-independent: a reversed survivor list yields the identical Aggregate" {

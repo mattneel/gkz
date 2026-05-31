@@ -902,3 +902,34 @@ job-file naming is collision-free for the sequential MVP (a future parallel `Io.
 an atomic counter — documented).
 
 Gate: **891 tests green** (289 base + 4 reload-gate + 4 proc-gate per Debug/ReleaseSafe/ReleaseFast).
+
+### Phase 9 — closing the §13 deferrals (socket server, fork execution, parallel dispatch)
+
+The first Phase-9 pass delivered the core but deferred three things that are NAMED/implied §13 deliverables
+and testable on one machine — a punt dressed as "behind a seam." All three are now built and gated (no
+"deferred" category for SPEC clauses; a clause is met or it is a §14/§15 non-goal):
+- **Query server OVER A SOCKET** (§13): `qserver.serveUnix` is a real `std.Io.net` Unix-domain accept loop
+  framing `[u32 len][sim_id][GKZQ1]`→`[u32 len][GKZR1]` over `handle`. Gate (d) runs it in an `Io.Group`
+  with a real client and asserts the socket reply equals `respond()` byte-for-byte (not a bind-only smoke).
+- **Fork execution** (§13 "forks from a snapshot + a diverged input stream"): `executor.runJobBytes`'s
+  `.fork` arm restores the base World from the snapshot bytes (`readWorld`→`fromParts`), replays the
+  diverged input stream for `tick_budget` ticks via `captureStream`, and returns the final snapshot +
+  per-tick stream digest. Gate (e): in-process == subprocess final bytes, pinned `FORK_STREAM_DIGEST`, and
+  the restored final World shows the fork actually advanced (hp 2→0).
+- **Parallel dispatch across cores** (§13 throughput): `Supervisor.runJobs` dispatches shards concurrently
+  via `Io.Group` when `io != null and n_workers > 1` — each shard task writes its own index-addressed slot
+  (no shared-state race; the executor's job-file `seq` is now `@atomicRmw`), and the merged result is
+  assembled post-join in canonical shard-index order. Gate (b) runs 3 real worker processes concurrently
+  and asserts the merged Aggregate equals the sequential run; a supervisor unit test proves parallel ==
+  sequential in-process too (so the parallel path is gated even where spawn is denied).
+
+Proven feasible before building (no more API-excuse punts): an 8-way concurrent `Io.Group` subprocess spawn
+and a Unix-socket round-trip both pass in this sandbox.
+
+**The one genuine edge left:** distributing workers to OTHER machines (a `NetworkExecutor` reaching a remote
+worker daemon over TCP). It is the SAME GKZJ1/GKZK1 frames over the same socket transport the query server
+already proves — but a true cross-HOST gate needs a second machine, which isn't available here (localhost
+TCP would be a faithful proxy). §13's concrete bullets — one-process-per-sim, supervisor + forks, query
+server over a socket, across-cores throughput — are all met and gated.
+
+Gate: **897 tests green** (290 base + 4 reload-gate + 5 proc-gate per Debug/ReleaseSafe/ReleaseFast).

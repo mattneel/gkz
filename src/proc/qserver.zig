@@ -5,10 +5,11 @@
 //! `[GKZR1]`. The Engine borrows `*const` (D1: the server never mutates a World).
 //!
 //! `handle()` is the multiplexing CORE — pure-ish (no IO), testable everywhere, byte-equal to calling
-//! `respond()` directly. The real socket transport (a `std.Io.net` Unix-domain socket accept-loop over a
-//! temp path — no TCP port to collide in CI) is a deferred control-plane seam; the proc gate proves the
-//! Unix socket binds+connects on this host (the substrate works) and that `handle()` matches `respond()`.
-//! Auth/TLS, persistent multi-request connections, and a live worker-attach registry are deferred with it.
+//! `respond()` directly. `serveUnix()` is the REAL socket transport: a `std.Io.net` Unix-domain accept
+//! loop (no TCP port to collide in CI) that frames `[u32 len][u32 sim_id][GKZQ1]` requests and `[u32 len]
+//! [GKZR1]` replies over `handle`. The proc gate runs it in an `Io.Group` with a real client and asserts
+//! the socket reply equals `respond()` byte-for-byte. Auth/TLS, a persistent multi-request connection, and
+//! a live worker-attach registry are the deferred control-plane refinements.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -18,6 +19,7 @@ const engine = @import("../query/engine.zig");
 const worldmod = @import("../world.zig");
 const EventLog = @import("../event_log.zig").EventLog;
 const Sys = @import("../schedule.zig").Sys;
+const net = std.Io.net;
 
 pub const ServerError = error{UnknownSim} || serialize.Error || Allocator.Error;
 
@@ -54,11 +56,44 @@ pub fn QueryServer(comptime R: type, comptime systems: []const Sys(R)) type {
             try wire.respond(R, systems, gpa, eng, frame[r.pos..], out);
         }
 
-        // The real socket TRANSPORT — a `std.Io.net.UnixAddress` accept-loop that frames `[u32 len][frame]`
-        // requests/replies over `handle` — is a deferred control-plane seam (Phase 9 control plane). The
-        // proc gate proves the Unix-domain socket binds+connects on this host (the transport substrate
-        // works); the multiplexing logic that the loop would call is `handle` above, fully gated. Auth/TLS,
-        // a persistent multi-request connection, and a live worker-attach registry are deferred with it.
+        /// The real socket transport: accept up to `n_requests` connections on `server` (a bound
+        /// `std.Io.net` Unix-domain listener), and for each read a length-framed `[u32 len][u32 sim_id]
+        /// [GKZQ1]` request, route it via `handle`, and write a length-framed `[u32 len][GKZR1]` reply.
+        /// One request per connection (a persistent multi-request connection is a refinement). Run it in
+        /// an `Io.Group` alongside the client (the proc gate does exactly this). A malformed/unknown
+        /// request replies an empty frame rather than aborting the server (a typed error frame is a
+        /// deferred refinement); OOM propagates.
+        pub fn serveUnix(self: *Self, io: std.Io, gpa: Allocator, server: *net.Server, n_requests: usize) !void {
+            var i: usize = 0;
+            while (i < n_requests) : (i += 1) {
+                var stream = try server.accept(io);
+                defer stream.close(io);
+
+                var rbuf: [4096]u8 = undefined;
+                var sr = stream.reader(io, &rbuf);
+                const r = &sr.interface;
+                const len = std.mem.readInt(u32, try r.takeArray(4), .little);
+                const frame = try r.readAlloc(gpa, len);
+                defer gpa.free(frame);
+
+                var resp: std.ArrayList(u8) = .empty;
+                defer resp.deinit(gpa);
+                var osink = serialize.ByteSink{ .list = &resp, .gpa = gpa };
+                self.handle(gpa, frame, &osink) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {}, // unknown sim / malformed request → empty reply, server stays up
+                };
+
+                var wbuf: [4096]u8 = undefined;
+                var sw = stream.writer(io, &wbuf);
+                const w = &sw.interface;
+                var lh: [4]u8 = undefined;
+                std.mem.writeInt(u32, &lh, @intCast(resp.items.len), .little);
+                try w.writeAll(&lh);
+                try w.writeAll(resp.items);
+                try w.flush();
+            }
+        }
     };
 }
 

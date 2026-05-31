@@ -3,9 +3,9 @@
 //! and proves:
 //!   (a) the SUBPROCESS result bytes == the IN-PROCESS result bytes == a pinned AGG_DIGEST (identical
 //!       across Debug/ReleaseSafe/ReleaseFast) — the headline cross-PROCESS determinism witness.
-//!   (b) a sharded sweep run across REAL worker processes (Supervisor over the subprocess executor) merges
-//!       to the SAME Aggregate as the unsharded one (the §4 "scheduling nondeterministic, results never
-//!       are" principle, lifted to processes; merge-order independence itself is proven in supervisor.zig).
+//!   (b) a sharded sweep dispatched in PARALLEL across REAL worker processes (Supervisor + Io.Group) merges
+//!       to the SAME Aggregate as a sequential run and as the unsharded one (the §4 "scheduling
+//!       nondeterministic, results never are" principle, lifted to concurrent processes).
 //!   (c) a deliberately CRASHING worker (SIGABRT) is harvested as a Defect with the dispatched job as the
 //!       repro — the parent survives and the other shards merge correctly; a HANGING worker hits the
 //!       timeout and is killed+reaped (not a hang).
@@ -34,6 +34,19 @@ const AGG_DIGEST: u64 = 6244768177935764897;
 const LO: u64 = 0;
 const HI: u64 = 3;
 const MAX_TICKS: u64 = 6;
+
+/// PINNED: the per-tick stream digest of the fork job (base hp=2, drain 2 ticks). Identical across modes
+/// and across the in-process / subprocess transports. Recompute via dumpPin.
+const FORK_STREAM_DIGEST: u64 = 13641851403073915758;
+
+const net = std.Io.net;
+const QS = proc.QueryServer(shared.R, &shared.systems);
+/// Run the query server for one request inside an Io.Group (errors captured for the test to surface).
+fn serveOne(srv: *QS, io: std.Io, gpa: std.mem.Allocator, server: *net.Server, out_err: *?anyerror) void {
+    srv.serveUnix(io, gpa, server, 1) catch |e| {
+        out_err.* = e;
+    };
+}
 
 fn buildJob(gpa: std.mem.Allocator, lo: u64, hi: u64, oracle_set_id: u16) !std.ArrayList(u8) {
     var buf: std.ArrayList(u8) = .empty;
@@ -88,21 +101,34 @@ test "(a) cross-process: in-process == subprocess result bytes, pinned across mo
     try testing.expectEqual(AGG_DIGEST, digest(sub.items));
 }
 
-test "(b) sharded sweep over REAL workers == unsharded; merge is order-independent" {
+test "(b) sharded sweep over REAL workers dispatched in PARALLEL == sequential == unsharded" {
     const gpa = testing.allocator;
+    const io = testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const jd = try jobDir(gpa, &tmp);
     defer gpa.free(jd);
-    var ctx = proc.SubprocCtx{ .exe_path = build_opts.worker_exe_path, .job_dir = jd, .io = testing.io, .timeout_ms = 30000 };
+    var ctx = proc.SubprocCtx{ .exe_path = build_opts.worker_exe_path, .job_dir = jd, .io = io, .timeout_ms = 30000 };
 
-    var sup = proc.Supervisor(u64){ .gpa = gpa, .executor = proc.subprocessExecutor(&ctx), .n_workers = 2, .max_restarts = 1 };
-    var three = try sup.runSweep(LO, HI, 3, MAX_TICKS, 0);
-    defer three.deinit(gpa);
-    if (three.spawn_denied) return error.SkipZigTest; // spawn denied — honest skip
-    try testing.expectEqual(@as(usize, 0), three.defects.len);
-    try testing.expectEqual(@as(i128, 9), three.agg.sum); // 3 real workers, merged by shard index == 9
-    try testing.expectEqual(@as(u64, 3), three.agg.count);
+    // PARALLEL: 3 shards run concurrently across worker PROCESSES (Io.Group). Merge is by shard index, so
+    // the result is independent of which child finished when — the §4 principle lifted to real processes.
+    var par = proc.Supervisor(u64){ .gpa = gpa, .executor = proc.subprocessExecutor(&ctx), .io = io, .n_workers = 3, .max_restarts = 1 };
+    var rp = try par.runSweep(LO, HI, 3, MAX_TICKS, 0);
+    defer rp.deinit(gpa);
+    if (rp.spawn_denied) return error.SkipZigTest; // spawn denied — honest skip
+    try testing.expectEqual(@as(usize, 0), rp.defects.len);
+    try testing.expectEqual(@as(i128, 9), rp.agg.sum); // 3 real workers, concurrent, merged by index == 9
+    try testing.expectEqual(@as(u64, 3), rp.agg.count);
+
+    // SEQUENTIAL: same range, no concurrency (io=null) — bit-identical merged Aggregate (parallelism does
+    // not perturb the result, only the wall-clock).
+    var seqv = proc.Supervisor(u64){ .gpa = gpa, .executor = proc.subprocessExecutor(&ctx), .n_workers = 1, .max_restarts = 1 };
+    var rs = try seqv.runSweep(LO, HI, 3, MAX_TICKS, 0);
+    defer rs.deinit(gpa);
+    try testing.expectEqual(rp.agg.sum, rs.agg.sum);
+    try testing.expectEqual(rp.agg.count, rs.agg.count);
+    try testing.expectEqual(rp.agg.min, rs.agg.min);
+    try testing.expectEqual(rp.agg.max, rs.agg.max);
 }
 
 test "(c) a crashing worker is harvested as a Defect=repro (parent survives); a hung worker times out" {
@@ -195,24 +221,121 @@ test "(d) query server: handle() == respond() bytes; the Unix socket transport b
     try gkz.query_wire.respond(Game, &shared.systems, gpa, eng, frame.items[4..], &ds);
     try testing.expectEqualSlices(u8, direct.items, via.items);
 
-    // the real Unix-domain socket transport binds + a client connects (the accept-loop serve is the
-    // deferred control-plane seam; handle() above is the gated multiplexing substance).
+    // REAL socket round-trip: serve one request over a Unix-domain socket (server in an Io.Group), have a
+    // client send the framed [u32 len][sim_id][GKZQ1] request and read the [u32 len][GKZR1] reply, and
+    // assert the socket reply equals respond() byte-for-byte. (Not a bind-only smoke — the whole transport.)
+    const io = testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const sock_path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/q.sock", .{tmp.sub_path});
     defer gpa.free(sock_path);
-    const ua = std.Io.net.UnixAddress.init(sock_path) catch return error.SkipZigTest;
-    var listener = ua.listen(testing.io, .{}) catch return error.SkipZigTest;
-    defer listener.deinit(testing.io);
-    var stream = ua.connect(testing.io) catch return error.SkipZigTest;
-    stream.close(testing.io);
+    const ua = net.UnixAddress.init(sock_path) catch return error.SkipZigTest;
+    var listener = ua.listen(io, .{}) catch return error.SkipZigTest;
+    defer listener.deinit(io);
+
+    var serr: ?anyerror = null;
+    var group: std.Io.Group = .init;
+    group.async(io, serveOne, .{ &srv, io, gpa, &listener, &serr });
+
+    var sock_reply: std.ArrayList(u8) = .empty;
+    defer sock_reply.deinit(gpa);
+    {
+        var stream = try ua.connect(io);
+        defer stream.close(io);
+        // send [u32 len][frame]
+        var wbuf: [4096]u8 = undefined;
+        var sw = stream.writer(io, &wbuf);
+        const cw = &sw.interface;
+        var lh: [4]u8 = undefined;
+        std.mem.writeInt(u32, &lh, @intCast(frame.items.len), .little);
+        try cw.writeAll(&lh);
+        try cw.writeAll(frame.items);
+        try cw.flush();
+        // read [u32 len][GKZR1]
+        var rbuf: [4096]u8 = undefined;
+        var sr = stream.reader(io, &rbuf);
+        const r = &sr.interface;
+        const rlen = std.mem.readInt(u32, try r.takeArray(4), .little);
+        const reply = try r.readAlloc(gpa, rlen);
+        defer gpa.free(reply);
+        try sock_reply.appendSlice(gpa, reply);
+    }
+    try group.await(io);
+    if (serr) |se| return se;
+    try testing.expectEqualSlices(u8, direct.items, sock_reply.items); // socket reply == respond() bytes
 }
 
-// NOT a test — recompute AGG_DIGEST after an intentional change (the pin is verified by (a) above).
+fn buildForkJob(gpa: std.mem.Allocator, snap_bytes: []const u8, tick_budget: u64) !std.ArrayList(u8) {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var sink = serialize.ByteSink{ .list = &buf, .gpa = gpa };
+    try proc.job.writeJob(&sink, .{ .fork = .{ .snapshot_bytes = snap_bytes, .base_tick = 0, .base_hash = 0, .diverged_inputs = &.{}, .tick_budget = tick_budget } });
+    return buf;
+}
+
+test "(e) fork execution: in-process == subprocess final snapshot + stream digest (pinned)" {
+    const gpa = testing.allocator;
+    // base World: one Health entity hp=2; snapshot it (the process-portable fork seed)
+    var w0 = try shared.seedHp(gpa, 0);
+    defer w0.deinit(gpa);
+    var base = try gkz.snapshot(shared.R, gpa, &w0);
+    defer base.deinit(gpa);
+
+    var fjob = try buildForkJob(gpa, base.bytes, 2); // drain runs 2 ticks → hp 2 → 0
+    defer fjob.deinit(gpa);
+
+    // in-process fork
+    var inproc: std.ArrayList(u8) = .empty;
+    defer inproc.deinit(gpa);
+    var s1 = serialize.ByteSink{ .list = &inproc, .gpa = gpa };
+    _ = try proc.inProcessExecutor(shared).run(gpa, fjob.items, &s1);
+    var d1 = try proc.job.decodeResult(u64, gpa, inproc.items);
+    defer d1.deinit();
+    try testing.expectEqual(FORK_STREAM_DIGEST, d1.result.final.stream_digest);
+    // the fork genuinely ADVANCED the World: restore the final snapshot, entity 0's hp == 0.
+    var rdr = serialize.ByteReader{ .bytes = d1.result.final.snapshot_bytes };
+    const parts = try serialize.readWorld(shared.R, gpa, &rdr);
+    var wf = gkz.World(shared.R).fromParts(parts);
+    defer wf.deinit(gpa);
+    try testing.expectEqual(@as(i32, 0), wf.get(.{ .index = 0, .generation = 0 }, shared.Health).?.hp);
+
+    // subprocess fork — a real worker restores the snapshot, steps, and returns the final snapshot.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const jd = try jobDir(gpa, &tmp);
+    defer gpa.free(jd);
+    var ctx = proc.SubprocCtx{ .exe_path = build_opts.worker_exe_path, .job_dir = jd, .io = testing.io, .timeout_ms = 30000 };
+    var sub: std.ArrayList(u8) = .empty;
+    defer sub.deinit(gpa);
+    var s2 = serialize.ByteSink{ .list = &sub, .gpa = gpa };
+    const outcome = try proc.subprocessExecutor(&ctx).run(gpa, fjob.items, &s2);
+    switch (outcome) {
+        .spawn_failed => return error.SkipZigTest,
+        .crashed => return error.TestUnexpectedResult,
+        .ok => {},
+    }
+    try testing.expectEqualSlices(u8, inproc.items, sub.items); // cross-process fork determinism, bit for bit
+}
+
+// NOT a test — recompute the pins after an intentional change (each is verified by a test above).
 comptime {
     _ = &dumpPin;
 }
 fn dumpPin(gpa: std.mem.Allocator) !void {
+    var w0 = try shared.seedHp(gpa, 0);
+    defer w0.deinit(gpa);
+    var base = try gkz.snapshot(shared.R, gpa, &w0);
+    defer base.deinit(gpa);
+    var fjob = try buildForkJob(gpa, base.bytes, 2);
+    defer fjob.deinit(gpa);
+    var fout: std.ArrayList(u8) = .empty;
+    defer fout.deinit(gpa);
+    var fs = serialize.ByteSink{ .list = &fout, .gpa = gpa };
+    _ = try proc.inProcessExecutor(shared).run(gpa, fjob.items, &fs);
+    var fd = try proc.job.decodeResult(u64, gpa, fout.items);
+    defer fd.deinit();
+    std.debug.print("\nFORK_STREAM_DIGEST = {d};\n", .{fd.result.final.stream_digest});
+
     var jb = try buildJob(gpa, LO, HI, 0);
     defer jb.deinit(gpa);
     var out: std.ArrayList(u8) = .empty;

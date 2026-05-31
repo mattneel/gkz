@@ -54,7 +54,7 @@ zig build run      # build and run the CLI
 zig build          # build the CLI to zig-out/bin/gkz
 ```
 
-`zig build test` is the determinism gate: it runs **891 tests in all three optimize modes** and pins a
+`zig build test` is the determinism gate: it runs **897 tests in all three optimize modes** and pins a
 suite of digests — an end-to-end content hash, a per-tick hash-stream digest, an event-log digest, the
 VOPR's frozen replay constants, the eight query-result digests, the violation/spec/metric digests, and a
 frozen v1 migration image + migrated-World digests + reload-stream digest — asserted identically in every
@@ -213,20 +213,25 @@ author), but it **detects** a bad reload.
 | `executor.zig` | The `Executor` transport seam: `inProcessExecutor` (determinism floor) + `subprocessExecutor` (a real `std.process.run` child, temp-file job, timeout-bounded, crash/hang/spawn-fail harvested) |
 | `worker.zig` · `worker_main.zig` | The one-shot worker (`gkz worker <job>`): read a job, run it against a comptime-fixed registry, write the result frame to stdout |
 | `supervisor.zig` | The process pool: shard a sweep, dispatch index-addressed, restart-on-crash (the job is the repro), merge survivors in canonical shard-index order |
-| `qserver.zig` | The query server: `respond()` (unchanged) multiplexed across live sims by `sim_id`; a Unix-socket transport seam |
+| `qserver.zig` | The query server: `respond()` (unchanged) multiplexed across live sims by `sim_id`, served over a real `std.Io.net` Unix-domain socket (`serveUnix`) |
 
 A sim runs as **one OS process** (crash-isolation: a defect can't take the node down, *and* a crash is a
-repro, §9). A `Supervisor` shards a seed sweep across worker processes via an `Executor`, harvests each
-shard into an **index-addressed** slot, restarts a crashed worker a bounded number of times (recording the
-job as a re-runnable repro), and merges survivors by shard index — so the result is bit-identical to a
-single-process sweep, regardless of which process finished when (§4's "scheduling nondeterministic, results
-never are", lifted to processes). The control plane is **exogenous** — it never enters the determinism
-guarantee — but it must *preserve* determinism, and the gate proves it: a real subprocess's per-tick result
-bytes **equal the in-process bytes and pin to the same digest in all three modes**, a deliberately crashing
-worker is harvested as a `Term.signal` repro (which a disguised in-process run structurally cannot fake),
-and a hung worker is killed by the timeout. Deferred behind the `Executor`/`SystemSource` seams:
-multi-machine distribution, parallel `Io.async` dispatch, the socket accept-loop + auth, and the reload/
-migrate *trigger*.
+repro, §9). A `Supervisor` shards a seed sweep across worker processes via an `Executor` and dispatches them
+**in parallel** (`Io.Group`, real across-cores throughput), harvests each shard into an **index-addressed**
+slot, restarts a crashed worker a bounded number of times (recording the job as a re-runnable repro), and
+merges survivors by shard index — so the result is bit-identical to a single-process sweep, regardless of
+which process finished when (§4's "scheduling nondeterministic, results never are", lifted to concurrent
+processes). **Forks** restore a snapshot and replay a diverged input stream in a worker. The **query server**
+serves the §7 `respond()` surface over a real Unix-domain socket, multiplexed by `sim_id`. The control plane
+is **exogenous** — it never enters the determinism guarantee — but it must *preserve* determinism, and the
+gate proves it: a real subprocess's per-tick result bytes **equal the in-process bytes and pin to the same
+digest in all three modes**, a sharded sweep run concurrently across real worker processes equals the
+sequential one, a deliberately crashing worker is harvested as a `Term.signal` repro (which a disguised
+in-process run structurally cannot fake), a hung worker is killed by the timeout, and the socket reply equals
+`respond()` byte-for-byte. The one genuine frontier — distributing workers to **other machines** (a
+`NetworkExecutor` over the same job/result frames + transport) — needs a second host to gate and is reachable
+through the same `Executor` seam; the reload/migrate *trigger* and auth/TLS are the remaining control-plane
+refinements.
 
 ### Determinism contract (the spine)
 
@@ -251,7 +256,7 @@ contract:
 - **Phase 7** — Agent harnesses & evaluation (§10) ✅
 - **Phase 8** — Hot-reload & schema migration (§12): real `dlopen` native-systems loading + version-tagged `World→World` migrations ✅
 - **Phase 9** — Process model & control plane (§13): one-process-per-sim supervisor pool, cross-process sweep sharding, crash-as-repro harvesting, the query server ✅
-- **Next** — the §13 control-plane surface: a watch-driven reload/migrate **trigger** (into Phase 8's `SystemSource` seam), parallel `Io.async` dispatch, multi-machine distribution + a real socket protocol (all behind the `Executor` seam built here)
+- **Next** — distributing workers to **other machines** (a `NetworkExecutor` over the same job/result frames; needs a second host to gate), plus the control-plane refinements: a watch-driven reload/migrate **trigger** (into Phase 8's `SystemSource` seam) and socket auth — all behind the `Executor`/`SystemSource` seams built here
 - **Phase 2b** — real thread-pool execution (the scheduler architecture already makes it safe)
 
 See [`PLAN.md`](./PLAN.md) §6 for the full phase map.

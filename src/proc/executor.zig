@@ -15,6 +15,11 @@ const Allocator = std.mem.Allocator;
 const serialize = @import("../serialize.zig");
 const metric = @import("../spec/metric.zig");
 const generator = @import("../vopr/generator.zig");
+const snapshotmod = @import("../snapshot.zig");
+const runmod = @import("../vopr/run.zig");
+const schedulemod = @import("../schedule.zig");
+const worldmod = @import("../world.zig");
+const input = @import("../input.zig");
 const job = @import("job.zig");
 
 /// How a worker terminated, from the parent's view. All are faults to be harvested with the dispatched
@@ -81,7 +86,30 @@ pub fn runJobBytes(comptime Spec: type, gpa: Allocator, job_bytes: []const u8, o
             }
             try job.writeResult(Spec.MetricT, out, .{ .aggregate = .{ .agg = agg, .defect = null } });
         },
-        .fork => return error.WorkerProtocol, // fork EXECUTION is a deferred seam (codec supported, not gated)
+        .fork => |f| {
+            // §13 fork: restore the base World from its snapshot, replay the diverged input stream for
+            // tick_budget ticks via the comptime systems, and return the final snapshot + per-tick stream
+            // digest. The input stream is allocated FIRST so restore→captureStream are back-to-back (no
+            // fallible op between them that could leak the restored World — captureStream takes ownership).
+            const n: usize = @intCast(f.tick_budget);
+            const inputs = try gpa.alloc(input.Input, n);
+            defer gpa.free(inputs);
+            for (inputs, 0..) |*in, i| {
+                in.* = if (i < f.diverged_inputs.len) f.diverged_inputs[i] else .{ .tick = @intCast(i + 1), .commands = &.{} };
+            }
+            // restore the base World directly from the (const) snapshot bytes (readWorld → fromParts, the
+            // snapshot.restore handoff; Snapshot.bytes is []u8 so we bypass that wrapper for []const u8).
+            var reader = serialize.ByteReader{ .bytes = f.snapshot_bytes };
+            const parts = try serialize.readWorld(Spec.R, gpa, &reader);
+            const w0 = worldmod.World(Spec.R).fromParts(parts); // consumed by captureStream next
+            const exec = comptime &schedulemod.Schedule(Spec.R, &Spec.systems).exec_order;
+            var cap = try runmod.captureStream(Spec.R, gpa, w0, inputs, &Spec.systems, exec, null);
+            defer cap.final.deinit(gpa);
+            defer gpa.free(cap.hashes);
+            var fsnap = try snapshotmod.snapshot(Spec.R, gpa, &cap.final);
+            defer fsnap.deinit(gpa);
+            try job.writeResult(Spec.MetricT, out, .{ .final = .{ .snapshot_bytes = fsnap.bytes, .stream_digest = runmod.streamDigest(cap.hashes) } });
+        },
     }
 }
 
@@ -127,10 +155,11 @@ pub fn subprocessExecutor(ctx: *SubprocCtx) Executor {
             const self: *SubprocCtx = @ptrCast(@alignCast(opaque_ctx));
             const io = self.io;
 
-            // unique cwd-relative job-file path: <job_dir>/gkzjob_<seq>.gkzj
-            const name = std.fmt.allocPrint(gpa, "{s}/gkzjob_{d}.gkzj", .{ self.job_dir, self.seq }) catch return error.OutOfMemory;
+            // unique cwd-relative job-file path: <job_dir>/gkzjob_<seq>.gkzj. The seq is bumped atomically
+            // so PARALLEL dispatch (multiple tasks sharing this ctx) still gets collision-free names.
+            const n = @atomicRmw(u64, &self.seq, .Add, 1, .monotonic);
+            const name = std.fmt.allocPrint(gpa, "{s}/gkzjob_{d}.gkzj", .{ self.job_dir, n }) catch return error.OutOfMemory;
             defer gpa.free(name);
-            self.seq += 1;
 
             // write the job to the temp file (relative to cwd, which the child inherits)
             writeJobFile(io, name, job_bytes) catch return error.WorkerProtocol;
@@ -188,7 +217,6 @@ fn writeJobFile(io: std.Io, rel_path: []const u8, bytes: []const u8) !void {
 
 const testing = std.testing;
 const Registry = @import("../registry.zig").Registry;
-const worldmod = @import("../world.zig");
 const q = @import("../query.zig");
 const simctx = @import("../simctx.zig");
 const schedule = @import("../schedule.zig");
