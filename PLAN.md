@@ -4,21 +4,22 @@
 > order** it gets built, and records the architectural decisions made along the way. The primary user
 > is an AI; every decision below favors determinism, legibility, and a tight feedback loop.
 
-Status: **Phases 1–6 implemented; all determinism gates green; adversarial reviews passed.**
+Status: **Phases 1–7 implemented; all determinism gates green; adversarial reviews passed.**
 **Foundation (§1–§3/§6)** + **Systems & scheduler (§4)** + **Events & causality (§5)** + **the VOPR
-(§9)** + **the §7 query surface** + **§8 specs/invariants/properties** are complete: **612 tests** across
-Debug/ReleaseSafe/ReleaseFast — pinned end-to-end + per-tick-stream hashes (cross-build bit-identity, D2),
-an order-permutation gate (execution-order independence), an events-OFF==events-ON hash-invariance gate +
-a pinned event-log digest, the VOPR capstone (an injected determinism bug is caught/bisected/minimized/
-explained; a clean schedule reports zero defects) with an `OutOfMemory`-injection sweep proving the VOPR
-pipeline leak-/double-free-safe, the §7 query surface with 8 pinned cross-build GKZR1 result digests + a
-SCRAMBLE invariance sub-gate, and the §8 spec layer (state invariants + seven closed temporal combinators
-+ integer intent-metrics) with exact-(tick,witness) catches for both canonical temporal examples, pinned
-violation/spec/metric digests, a checks-on==off hash-invariance sub-gate, and a temporal Defect riding
-sweep→minimize→provenance. Commits: Phase 1 `a589d39`, Phase 2 `37748cf`, Phase 3 `1a33f29`, Phase 4
-`9be50c3`, Phase 5 `0540f86`; Phase 6 lands in this commit (adversarial review 9/10 confirmed — fixes:
-an `errdefer`-on-`buildRun`-consumed-world double-free in 5 test helpers, a `responds` overflow D2 hazard
-(`+|`), an i64 field-cast comptime guard, and three test-coverage gaps).
+(§9)** + **the §7 query surface** + **§8 specs/invariants/properties** + **§10 agent harnesses** are
+complete: **693 tests** across Debug/ReleaseSafe/ReleaseFast — pinned end-to-end + per-tick-stream hashes
+(cross-build bit-identity, D2), an order-permutation gate, an events-OFF==events-ON hash-invariance gate +
+a pinned event-log digest, the VOPR capstone with an `OutOfMemory`-injection sweep, the §7 query surface
+with 8 pinned cross-build GKZR1 digests + a SCRAMBLE invariance sub-gate, the §8 spec layer (state
+invariants + seven closed temporal combinators + integer intent-metrics) with exact-(tick,witness)
+catches + pinned violation/spec/metric digests, and the §10 agent harness — an agent is an external
+nondeterministic source CAPTURED at the Input boundary (never re-invoked on replay), with the capstone
+proving a genuinely irreproducible agent's captured run replays bit-identically across all 3 modes (and
+is then VOPR-minimizable). Commits: Phase 1 `a589d39`, Phase 2 `37748cf`, Phase 3 `1a33f29`, Phase 4
+`9be50c3`, Phase 5 `0540f86`, Phase 6 `e6e6f00`; Phase 7 lands in this commit (adversarial review 8/10
+confirmed, never-re-invoke held — one HIGH fixed: the player-not-world boundary is now type-enforced
+(`Table.column` requires `*Self`; `owners`/`masks` return `[]const`), closing a `*const`-World mutable-
+slice leak the (d) gate had only tautologically tested).
 This document is the decision of record. It was produced from a
 3-architecture judge panel (5 independent lenses + synthesis) over ground truth extracted from
 SPEC.md, the `fpz` dependency, and the live Zig 0.16.0 toolchain.
@@ -316,7 +317,7 @@ Phase-1 `deferred_with_seams` provisions, so later phases bolt on without rework
 | **4. VOPR** ✅ | §9 | one `Oracle`/`Defect` abstraction (invariant · divergence; crash/`.trap` deferred to the build-mode/process boundary); seeded pluggable `Generator`; fault/timing injection (within-stage exec permutation + snapshot-cadence round-trip — none may change the per-tick hash) with first-tick bisection; kind-locked delta-debug minimization; provenance re-run (`causeChain`) on a hit; `sweep` a pure function of a seed range (the §13 sharding seam). Capstone: an undeclared-write system is caught/bisected/minimized/explained; the correct twin → zero defects. | reuses step/runScheduled/snapshot/digest/Recorder |
 | **5. Query surface** ✅ | §7 | minimalist hand-canonicalized relations (`component/3`, `event/5`, `caused_by/2`, `system/3`, `diverge/3`) + the 4 canonical shapes (Why/What-affects-X/Where-broke/Reachability) over a uniform `Value` substrate; self-describing catalog (`relation_schema`/`relation_column`); reflection from §4 access sets (never drifts); GKZQ1/GKZR1 serializable wire codec (the socket transport is Phase-9/S7). | **S5** |
 | **6. Specs / invariants / properties** ✅ | §8 | state invariants (the `fn(*const World)?Entity` shape, every-tick `checkAll` + VOPR `invariantOracle`); a CLOSED set of seven temporal combinators (always/eventually/stable/monotonic_unless/until/precedes/responds) folded over an O(T) projected-scalar `Trace` (bounded-trace/LTLf, witness-pinning); integer intent-metrics + sweep aggregate; the fun-oracle boundary as a TYPE distinction (checks→`?Violation`, metrics→`i64`, intent exogenous). Violations ride the §4 Defect (additive `.temporal` kind) through sweep→minimize→provenance and surface as the §7 `spec`/`violation` relations. | **S8** |
-| **7. Agent harnesses & evaluation** | §10 | `observe(State)->Input` policies (scripted/search/learned); mass faster-than-realtime evaluation; aggregate intent-metrics. NN inference is the *player*, not the *world*. | reuses Input channel |
+| **7. Agent harnesses & evaluation** ✅ | §10 | `Agent` = a thin newtype over `Generator(R)` + a `DeterminismClass`; an agent is an EXTERNAL source CAPTURED at the Input boundary (`buildRun`→`Run.inputs`), NEVER re-invoked on replay (`asAgent`/`scriptedGen` the only replay primitives — structural); `observe(State)->Input` via a read-only `ObsView` (the §7 query lens; player-not-world); reference deterministic policies (scripted/greedy, rng-keyed); the `ExternalAgent` fn-ptr seam (NN/LLM, root withheld); mass eval = reproducible sweep (deterministic) vs capture-to-revisit (`.external`) reusing §6 `aggregate`/§4 `sweep`; the §13 sharding math (`shardRanges`/`mergeAggregates`). NN inference is the *player*, not the *world*. | reuses Input channel; **S7** sharding math |
 | **8. Hot-reload & migration** | §12 | `dlopen`/`dlclose` of native systems (state stays in columns); version-tagged pure `World→World` schema migrations dispatched on `schema_version` + per-Kind fingerprint. | **S6** |
 | **9. Process model & control plane** | §13 | one-OS-process-per-sim; supervisor pool (spawn/monitor/restart/harvest); query server multiplexing live sims; forks from snapshot + diverged input. | **S7** |
 
@@ -582,3 +583,82 @@ Dismissed (1): a claim that the VOPR-flow re-anchor assertion is vacuous because
 failing tick (5) doesn't move under minimization — correct observation, but the assertion is valid and the
 tick-MOVING re-anchor case is already covered by the Phase-4 provenance regression on the shared
 minimize/provenance machinery a temporal Defect rides unchanged.
+
+---
+
+## 10. Phase 7 design — §10 agent harnesses & evaluation (decision of record, from the design judge-panel)
+
+5-architect / 5-lens judge panel + synthesis, with the **harness contract refinement as a HARD constraint** (not
+relitigated): a learned agent's inference is bit-irreproducible (INT8 tensor-core / GPU reduction order), so an agent
+is an **external nondeterministic source captured at the Input boundary, like a human** — reproducibility comes from
+recording the emitted `Input`s, never from reproducing the agent, and replay/VOPR **never re-invoke** it. **Spine =
+"Minimalist-Generator-extension"** (scope_realism winner=90; top-3 on determinism/spec): an `Agent(R)` is a thin
+newtype over the EXISTING `Generator(R)` carrying a `DeterminismClass` tag — capture is `buildRun`, replay is
+`scriptedGen(Run.inputs)`, mass-eval is Phase-6 `aggregate` / Phase-4 `sweep` called verbatim. **Three grafts:** (1)
+from External-seam (determinism + forward_compat winner) — make never-re-invoke **structural**: the only replay
+primitive is `scriptedGen` over `Run.inputs` and NO signature in `src/agent/` couples a Run to a policy ctx, plus the
+two-sided capstone (the source provably diverges on two direct calls AND an infer-call counter must NOT advance during
+replay); (2) from Observation-as-Query (ai_ergonomics winner; primary user is an AI) — `ObsView.engine()` makes the §7
+query `Engine` the first-class observation lens, so the policy's observation vocabulary IS the `term.Value` surface the
+AI debugs with (over a borrowed `*const World` + a const `EMPTY_LOG`, so observation never depends on the recorder —
+preserving events-off==events-on); (3) from Sweep-First (forward_compat graft) — ship the §13 sharding **math only**
+(`shardRanges` + an associative `mergeAggregates`, mean deferred), gate-proven so a future sharded sweep equals a
+single-process one field-for-field. **Rejected:** the typed Pure/External two-harness split (Contract-first, the
+determinism/spec winner) as spine — it forces two concrete harness facades that fragment every future consumer
+(ai_ergonomics=64, forward_compat=58); its strongest idea (deterministic policies RECEIVE `root` and key randomness
+through `rng.draw`; external never receives `root`) is kept as **value-level discipline** on the spine. Also rejected:
+a `RunCard` artifact and out-of-process transport (the Run IS the revisit record; IPC is Phase 9).
+
+**Determinism classes** (`enum{ deterministic_blind, deterministic_observing, external, replay }`, constructor-fixed):
+`isReproducible` = all but `.external`. Deterministic policies are pure in (seed,tick,view) → re-derivable, bit-
+reproducible sweeps; `.external` → run-level nondeterminism, captured once per seed (the `Run` is the artifact), valid
+for statistical metrics. **player-not-world** is enforced three ways: `ObsView` holds only `*const World` (a write is a
+compile error), the only egress is `?Input` through the normal `step` channel, and a comptime `@hasField` negative-
+surface test.
+
+**Modules (`src/agent/`), build order:** `observe.zig` (`ObsView` + §7 `engine()` lens + `world()`); `agent.zig`
+(`DeterminismClass`/`Agent` newtype + `asAgent`/`replayGen` — the structural never-re-invoke convertors);
+`policy.zig` (`Policy = observe(State)->Input` + `policyGen`); `reference.zig` (`scriptedAgent` + `greedyAgent` keyed
+through `rng.draw`); `external.zig` (the `ExternalAgent` fn-ptr seam; root withheld); `eval.zig` (`aggregateAgent`/
+`sweepAgent` — reproducible→`aggregate`/`sweep` verbatim, `.external`→capture-once record-to-revisit `[]Run`);
+`shard.zig` (`shardRanges` + `mergeAggregates`); `agent.zig` umbrella + `root.zig` wiring; `gate.zig`. **Phase-7 gate:**
+(a) a deterministic greedy sweep is bit-reproducible (pinned `GREEDY_SWEEP_SUM` + per-seed `streamDigest`, identical on
+a second run + across 3 modes); **(b) the capstone** — an impure `ExternalAgent` provably diverges on two direct
+`buildRun`s, then its captured Run replays bit-identically (hashes + `streamDigest` + final) across 3 modes WITHOUT
+advancing the invoked-counter; (c) the captured run rides `sweepAgent→minimize→provenance` (debuggable); (d) ObsView
+read-only (`@hasField` + per-tick digest-invariance); (e) intent-metrics aggregate over agent runs; (f) shard-merge
+equals single-process; (g) OOM-injection. **Deferred behind seams:** the actual NN/LLM/RL engine + GPU/INT8 (the
+`ExternalAgent.infer_fn` boundary), the process model + socket transport + shard EXECUTION (Phase 9; `shardRanges`/
+`mergeAggregates` + the §7 wire codec are the seams), training loops, search/MCTS policies, a feature-projection DSL,
+a recording-harness observation variant — each with a concrete already-verified seam.
+
+### Phase 7 notes (from the Phase-7 adversarial review — 8/10 confirmed, never-re-invoke held; one HIGH fixed)
+
+26. **Player-not-world made type-enforced** (HIGH, fixed). The boundary was NOT actually structural:
+    `Table.owners()/masks()/column()` were declared `*const Self` but returned MUTABLE slices (a
+    `MultiArrayList.items` quirk — it copies the list by value and does not propagate receiver constness),
+    so a policy could reach `ov.world().table.column(0)[0] = …` and corrupt hashed sim state with NO
+    `@constCast` — and the (d) gate was a tautology that only exercised `rowCount()`/`engine()`, never the
+    write path. Fixed in `storage.zig`: `column` now requires `*Self` (so `*const World.table.column(…)`
+    is a COMPILE ERROR), `owners`/`masks` return `[]const`, and `columnConst`/`masksMut` split the read vs
+    write paths (every read caller — serialize/hash/query/spec — uses the const variants; the §1 pinned
+    digests are unchanged since the bytes are identical). `observe.zig` documents the irreducible Zig
+    residual honestly (a policy reaching PAST the accessor API into the raw `rows.items`/`generation.items`
+    backing is misuse outside the contract — the determinism guarantee rests on CAPTURE, not policy
+    good-behavior; an out-of-band mutation would make the captured run un-replayable, a detectable
+    violation). The (d) gate now asserts the const return types (a real test that would have failed
+    before). *(PNW-1, TG-1.)*
+27. **Test/gate + doc hardening** (fixed). The (c) gate now asserts STRICT minimization (`min.inputs.len <
+    cap.inputs.len`), not `<=`; the (g) OOM-injection now covers the `.external` `aggregateAgent` branch
+    (the accumulating-`[]Run` errdefer path), not only the reproducible path; the capstone GUARD documents
+    why 5 ticks is coprime to the agent's `%3` counter period (a multiple-of-3 tick count would make the
+    irreproducibility guard a false pass); a `policyGen` `view == null` fallback test was added; and
+    `asAgent`/`replayGen` now document that BOTH `run` and `spec` must outlive the Agent. *(TG-2/3/4/5,
+    MS-1, NR-2.)*
+
+Dismissed (2): NR-1 (sweepAgent "re-invokes" an `.external` agent) — false positive: it misframes a
+forward FUZZ (each seed = a fresh captured playthrough, then minimize operates on the captured inputs via
+`scriptedGen`) as a forbidden REPLAY; the never-re-invoke contract holds. SF-1 (sweepAgent does not
+route on `DeterminismClass`) — intentional: sweeping a `.external` agent is the valid fuzz-N-playthroughs
+mode; debugging a SPECIFIC captured run uses `asAgent(run)` (`.replay`), and minimize/provenance never
+re-invoke either way.

@@ -113,6 +113,13 @@ pub const Property = spec.Property;
 pub const Metric = spec.Metric;
 pub const Trace = spec.Trace;
 
+// --- Phase 7: agent harnesses & evaluation (SPEC §10) ---
+pub const agent = @import("agent.zig");
+pub const Agent = agent.Agent;
+pub const DeterminismClass = agent.DeterminismClass;
+pub const ObsView = agent.ObsView;
+pub const ExternalAgent = agent.ExternalAgent;
+
 /// Bring-up placeholder so the scaffold `main.zig` keeps compiling during Phase 1. Replaced by a real
 /// kernel demo once `step`/`snapshot`/`replay` land.
 pub fn printAnotherMessage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -156,4 +163,5 @@ test {
     _ = query_wire;
     _ = query_gate;
     _ = spec;
+    _ = agent;
 }

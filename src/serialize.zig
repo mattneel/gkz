@@ -211,7 +211,7 @@ pub fn writeWorld(comptime R: type, gpa: Allocator, sink: anytype, world: anytyp
         try putInt(sink, u64, m);
         inline for (R.sorted, 0..) |ti, p| {
             if ((m & (@as(u64, 1) << @intCast(p))) != 0) {
-                try writeValue(sink, R.Component(ti), world.table.column(ti)[row]);
+                try writeValue(sink, R.Component(ti), world.table.columnConst(ti)[row]);
             }
         }
     }
@@ -258,7 +258,7 @@ pub fn readWorld(comptime R: type, gpa: Allocator, reader: *ByteReader) (Error |
         const m = try getInt(reader, u64);
         const e = Entity{ .index = idx, .generation = gen };
         const row = try table.spawnRow(gpa, e);
-        table.masks()[row] = @truncate(m); // total: never panics on a wide mask
+        table.masksMut()[row] = @truncate(m); // total: never panics on a wide mask
         inline for (R.sorted, 0..) |ti, p| {
             if ((m & (@as(u64, 1) << @intCast(p))) != 0) {
                 table.column(ti)[row] = try readValue(R.Component(ti), reader);

@@ -104,7 +104,7 @@ pub fn rangeI(comptime R: type, comptime C: type, comptime field: []const u8, co
     const Impl = struct {
         fn eval(w: *const worldmod.World(R)) AtomHit {
             const ti = comptime R.indexOf(C);
-            const col = w.table.column(ti);
+            const col = w.table.columnConst(ti);
             const owners = w.table.owners();
             const masks = w.table.masks();
             const bit = R.bit(ti);
@@ -129,7 +129,7 @@ pub fn referencedLive(comptime R: type, comptime C: type, comptime ref_field: []
     const Impl = struct {
         fn eval(w: *const worldmod.World(R)) AtomHit {
             const ti = comptime R.indexOf(C);
-            const col = w.table.column(ti);
+            const col = w.table.columnConst(ti);
             const owners = w.table.owners();
             const masks = w.table.masks();
             const bit = R.bit(ti);
@@ -156,7 +156,7 @@ pub fn noOverlap(comptime R: type, comptime C: type, comptime fx: []const u8, co
     const Impl = struct {
         fn eval(w: *const worldmod.World(R)) AtomHit {
             const ti = comptime R.indexOf(C);
-            const col = w.table.column(ti);
+            const col = w.table.columnConst(ti);
             const owners = w.table.owners();
             const masks = w.table.masks();
             const bit = R.bit(ti);
@@ -211,7 +211,7 @@ pub fn fieldLE(comptime R: type, comptime C: type, comptime field: []const u8, c
             if (w.table.rowOf(handle)) |row| {
                 const ti = comptime R.indexOf(C);
                 if ((w.table.masks()[row] & R.bit(ti)) != 0) {
-                    const v: i64 = @intCast(@field(w.table.column(ti)[row], field));
+                    const v: i64 = @intCast(@field(w.table.columnConst(ti)[row], field));
                     if (v <= thresh) return .{ .holds = true, .scalar = v };
                     return .{ .holds = false, .scalar = v, .witness = Witness.single(handle) };
                 }
@@ -231,7 +231,7 @@ pub fn scalarField(comptime R: type, comptime C: type, comptime field: []const u
             if (w.table.rowOf(handle)) |row| {
                 const ti = comptime R.indexOf(C);
                 if ((w.table.masks()[row] & R.bit(ti)) != 0) {
-                    return .{ .holds = true, .scalar = @intCast(@field(w.table.column(ti)[row], field)) };
+                    return .{ .holds = true, .scalar = @intCast(@field(w.table.columnConst(ti)[row], field)) };
                 }
             }
             return .{ .holds = false };

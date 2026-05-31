@@ -49,18 +49,33 @@ pub fn Table(comptime R: type) type {
             self.* = undefined;
         }
 
-        // --- column accessors (return mutable slices into the single backing allocation) ---
+        // --- column accessors ---
+        // owners/masks are READ-ONLY (managed by spawnRow/despawnRow; no caller writes them), so they
+        // return `[]const`. `column` returns a MUTABLE slice and takes `*Self`, so a `*const Table` (the
+        // read-only observation path, §10 ObsView) CANNOT reach a writable component slice — a write
+        // through an observe-only view is a compile error. Read-only callers use `columnConst`.
+        // NOTE: `MultiArrayList.items` copies the list by value and does not propagate receiver constness
+        // to the returned slice, so the `*Self` receiver on `column` is what enforces read-only-ness, not
+        // the slice element type.
 
-        /// The owner-entity column (one per row).
-        pub fn owners(self: *const Self) []Entity {
+        /// The owner-entity column (one per row), read-only.
+        pub fn owners(self: *const Self) []const Entity {
             return self.rows.items(comptime ownerField());
         }
-        /// The presence-mask column (one per row).
-        pub fn masks(self: *const Self) []R.Mask {
+        /// The presence-mask column (one per row), read-only.
+        pub fn masks(self: *const Self) []const R.Mask {
             return self.rows.items(comptime maskField());
         }
-        /// The storage column for component at tuple index `i`.
-        pub fn column(self: *const Self, comptime i: usize) []R.Component(i) {
+        /// The MUTABLE presence-mask column (the deserialize/restore write path; requires `*Self`).
+        pub fn masksMut(self: *Self) []R.Mask {
+            return self.rows.items(comptime maskField());
+        }
+        /// The MUTABLE storage column for component at tuple index `i` (write path; requires `*Self`).
+        pub fn column(self: *Self, comptime i: usize) []R.Component(i) {
+            return self.rows.items(comptime compField(i));
+        }
+        /// The read-only view of component column `i` (the observation / serialize / query read path).
+        pub fn columnConst(self: *const Self, comptime i: usize) []const R.Component(i) {
             return self.rows.items(comptime compField(i));
         }
 
@@ -133,7 +148,7 @@ pub fn Table(comptime R: type) type {
         /// not live.
         pub fn addComponent(self: *Self, e: Entity, comptime C: type, value: C) void {
             const row = self.rowOf(e) orelse return;
-            self.masks()[row] |= R.bitOf(C);
+            self.masksMut()[row] |= R.bitOf(C);
             self.column(R.indexOf(C))[row] = value;
         }
 
@@ -141,7 +156,7 @@ pub fn Table(comptime R: type) type {
         /// `e` is not live.
         pub fn removeComponent(self: *Self, e: Entity, comptime C: type) void {
             const row = self.rowOf(e) orelse return;
-            self.masks()[row] &= ~R.bitOf(C);
+            self.masksMut()[row] &= ~R.bitOf(C);
             self.column(R.indexOf(C))[row] = std.mem.zeroes(C);
         }
 

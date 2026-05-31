@@ -79,7 +79,7 @@ pub fn componentRel(comptime R: type, gpa: Allocator, w: *const worldmod.World(R
             if ((masks[row] & R.bit(ti)) != 0 and (filter.kind == null or filter.kind.? == kid)) {
                 scratch.clearRetainingCapacity();
                 var sink = serialize.ByteSink{ .list = &scratch, .gpa = gpa };
-                try serialize.writeValue(&sink, R.Component(ti), w.table.column(ti)[row]);
+                try serialize.writeValue(&sink, R.Component(ti), w.table.columnConst(ti)[row]);
                 const ref = try b.pushBytes(scratch.items);
                 try b.pushRow(rowOf3(.{ .entity = owner }, .{ .kind = kid }, .{ .bytes = ref }));
             }

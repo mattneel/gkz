@@ -10,12 +10,12 @@ Elm/Redux (state-as-value, time-travel), and `rr` (record-replay) — not the ma
 The primary user is an **AI** — authoring game logic and debugging running games. Every design choice
 is justified by one of those two jobs.
 
-> **Status:** Phases 1–6 are complete and verified — the foundation (the World as a value + pure
+> **Status:** Phases 1–7 are complete and verified — the foundation (the World as a value + pure
 > `step`), the deterministic scheduler (§4), events & causality (§5), the **VOPR** deterministic
-> simulator/defect-finder (§9), the **relational query surface** (§7), and **specs/invariants/temporal
-> properties** (§8). The kernel runs headless, end-to-end, with zero art, bit-identically across
-> Debug/ReleaseSafe/ReleaseFast. See [`PLAN.md`](./PLAN.md) for the full roadmap and
-> [`SPEC.md`](./SPEC.md) for the design contract.
+> simulator/defect-finder (§9), the **relational query surface** (§7), **specs/invariants/temporal
+> properties** (§8), and **agent harnesses & evaluation** (§10). The kernel runs headless, end-to-end,
+> with zero art, bit-identically across Debug/ReleaseSafe/ReleaseFast. See [`PLAN.md`](./PLAN.md) for the
+> full roadmap and [`SPEC.md`](./SPEC.md) for the design contract.
 
 ---
 
@@ -52,7 +52,7 @@ zig build run      # build and run the CLI
 zig build          # build the CLI to zig-out/bin/gkz
 ```
 
-`zig build test` is the determinism gate: it runs **612 tests in all three optimize modes** and pins a
+`zig build test` is the determinism gate: it runs **693 tests in all three optimize modes** and pins a
 suite of digests — an end-to-end content hash, a per-tick hash-stream digest, an event-log digest, the
 VOPR's frozen replay constants, the eight query-result digests, and the violation/spec/metric digests —
 asserted identically in every mode. All three modes passing *proves* `Debug == ReleaseSafe ==
@@ -62,10 +62,10 @@ with invariant checks compiled in or out.
 
 ---
 
-## What's implemented (Phases 1–6)
+## What's implemented (Phases 1–7)
 
-The world is fully playable, testable, fuzzable, queryable, and checkable with **zero art** — abstract
-placeholders only.
+The world is fully playable, testable, fuzzable, queryable, checkable, and agent-evaluable with **zero
+art** — abstract placeholders only.
 
 ### Phase 1 — Foundation (SPEC §1–§3, §6)
 
@@ -158,6 +158,24 @@ The **fun-oracle boundary** is enforced in the type system: invariants/propertie
 engine guarantees them); metrics return a *quantity* (the engine measures, never judges) — intent is
 exogenous, declared by the human/AI, never supplied by the kernel.
 
+### Phase 7 — Agent harnesses & evaluation (SPEC §10)
+
+| Module (`src/agent/`) | Responsibility |
+|---|---|
+| `observe.zig` · `agent.zig` | `ObsView` (read-only `*const` World + the §7 query lens); `Agent` = a `Generator` + `DeterminismClass`; `asAgent`/`replayGen` |
+| `policy.zig` · `reference.zig` | `observe(State)->Input` policies; `scriptedAgent` + `greedyAgent` (rule-based, rng-keyed, re-derivable) |
+| `external.zig` · `eval.zig` · `shard.zig` | the `ExternalAgent` NN/LLM fn-ptr seam; mass `aggregateAgent`/`sweepAgent`; the §13 shard math |
+
+An agent is a policy `observe(State) -> Input` on the **same Input channel as a human**. A learned/NN/LLM
+agent's inference is bit-irreproducible, so the kernel treats it as an **external nondeterministic source
+captured at the Input boundary** — reproducibility comes from *recording the emitted inputs*, never from
+reproducing the agent, and replay/VOPR **never re-invoke** it. That flips the apparent problem into a
+feature: a black-box agent's playthrough is captured as `(seed, inputs)` and becomes **bit-exactly
+replayable and VOPR-minimizable**. NN inference is the *player*, not the *world* — it reads a read-only
+observation and emits inputs; it never touches the integer-deterministic sim path. Deterministic policies
+give bit-reproducible sweeps; NN policies give run-level nondeterminism (fine for statistical metrics,
+captured per run to revisit).
+
 ### Determinism contract (the spine)
 
 `step` is pure; the World is a value; all randomness is a keyed, counter-based pure function; the
@@ -178,8 +196,9 @@ contract:
 - **Phase 4** — The VOPR (deterministic simulator: fuzzing, divergence detection, minimal repro) ✅
 - **Phase 5** — Introspection & relational query surface (§7) ✅
 - **Phase 6** — Specifications, invariants & properties (§8) ✅
-- **Phase 7** — Agent harnesses & evaluation (§10): `observe(State)->Input` policies, mass faster-than-realtime runs ← *next*
-- **Phase 8+** — Hot-reload & migration (§12), process model & control plane (§13)
+- **Phase 7** — Agent harnesses & evaluation (§10) ✅
+- **Phase 8** — Hot-reload & migration (§12): `dlopen` native systems, version-tagged `World→World` migrations ← *next*
+- **Phase 9+** — Process model & control plane (§13): supervisor pool, the query server, cross-process sweep sharding
 - **Phase 2b** — real thread-pool execution (the scheduler architecture already makes it safe)
 
 See [`PLAN.md`](./PLAN.md) §6 for the full phase map.

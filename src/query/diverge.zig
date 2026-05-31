@@ -302,7 +302,7 @@ test "diverge/3: identical runs produce an empty result" {
 fn hpNegative(w: *const worldmod.World(Game)) ?Entity {
     const owners = w.table.owners();
     const masks = w.table.masks();
-    const col = w.table.column(Game.indexOf(Health));
+    const col = w.table.columnConst(Game.indexOf(Health));
     const bit = Game.bitOf(Health);
     for (owners, 0..) |e, row| {
         if ((masks[row] & bit) != 0 and col[row].hp < 0) return e;

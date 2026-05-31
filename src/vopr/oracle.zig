@@ -192,7 +192,7 @@ const osys = [_]Sys(OReg){system(OReg, "drain", drainSystem)};
 fn hpNonNegative(w: *const OW) ?Entity {
     const owners = w.table.owners();
     const masks = w.table.masks();
-    const col = w.table.column(OReg.indexOf(Health));
+    const col = w.table.columnConst(OReg.indexOf(Health));
     const hp_bit = OReg.bitOf(Health);
     for (owners, 0..) |e, row| {
         if ((masks[row] & hp_bit) != 0 and col[row].hp < 0) return e;
