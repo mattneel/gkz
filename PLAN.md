@@ -4,18 +4,21 @@
 > order** it gets built, and records the architectural decisions made along the way. The primary user
 > is an AI; every decision below favors determinism, legibility, and a tight feedback loop.
 
-Status: **Phases 1–5 implemented; all determinism gates green; adversarial reviews passed.**
+Status: **Phases 1–6 implemented; all determinism gates green; adversarial reviews passed.**
 **Foundation (§1–§3/§6)** + **Systems & scheduler (§4)** + **Events & causality (§5)** + **the VOPR
-(§9)** + **the §7 query surface** are complete: **507 tests** across Debug/ReleaseSafe/ReleaseFast —
-pinned end-to-end + per-tick-stream hashes (cross-build bit-identity, D2), an order-permutation gate
-(execution-order independence), an events-OFF==events-ON hash-invariance gate + a pinned event-log
-digest, the VOPR capstone (an injected determinism bug is caught/bisected/minimized/explained; a clean
-schedule reports zero defects) with an `OutOfMemory`-injection sweep proving the VOPR pipeline leak-
-/double-free-safe, and the §7 query surface with 8 pinned cross-build GKZR1 result digests + a SCRAMBLE
-invariance sub-gate (canonical re-sort severs table/log/exec observation order). Commits: Phase 1
-`a589d39`, Phase 2 `37748cf`, Phase 3 `1a33f29`, Phase 4 `9be50c3`; Phase 5 lands in this commit
-(adversarial review 7/8 confirmed — one HIGH fixed: `readResult` rejects `arity==0`, closing an
-unbounded-allocation DoS on the untrusted control-plane decode path).
+(§9)** + **the §7 query surface** + **§8 specs/invariants/properties** are complete: **612 tests** across
+Debug/ReleaseSafe/ReleaseFast — pinned end-to-end + per-tick-stream hashes (cross-build bit-identity, D2),
+an order-permutation gate (execution-order independence), an events-OFF==events-ON hash-invariance gate +
+a pinned event-log digest, the VOPR capstone (an injected determinism bug is caught/bisected/minimized/
+explained; a clean schedule reports zero defects) with an `OutOfMemory`-injection sweep proving the VOPR
+pipeline leak-/double-free-safe, the §7 query surface with 8 pinned cross-build GKZR1 result digests + a
+SCRAMBLE invariance sub-gate, and the §8 spec layer (state invariants + seven closed temporal combinators
++ integer intent-metrics) with exact-(tick,witness) catches for both canonical temporal examples, pinned
+violation/spec/metric digests, a checks-on==off hash-invariance sub-gate, and a temporal Defect riding
+sweep→minimize→provenance. Commits: Phase 1 `a589d39`, Phase 2 `37748cf`, Phase 3 `1a33f29`, Phase 4
+`9be50c3`, Phase 5 `0540f86`; Phase 6 lands in this commit (adversarial review 9/10 confirmed — fixes:
+an `errdefer`-on-`buildRun`-consumed-world double-free in 5 test helpers, a `responds` overflow D2 hazard
+(`+|`), an i64 field-cast comptime guard, and three test-coverage gaps).
 This document is the decision of record. It was produced from a
 3-architecture judge panel (5 independent lenses + synthesis) over ground truth extracted from
 SPEC.md, the `fpz` dependency, and the live Zig 0.16.0 toolchain.
@@ -312,7 +315,7 @@ Phase-1 `deferred_with_seams` provisions, so later phases bolt on without rework
 | **3. Events & causality** ✅ | §5 | recording `EventEmitter` threaded through `SimCtx` into a **side** `EventLog` (owned by a `Recorder`, never in the hashed World); structural `EventId` + a **distinct, component-storable `CauseToken`** (storing an `EventId` in a component is a compile error); auto-attributed `SystemCause` nodes + cross-tick `causeTokenHere`/`causeFromToken`; `causesOf`/`causeChain` backward-walk; tiered on/off recording. **Events are hash-invariant** (events-OFF == events-ON, gated). Typed payload decode + the §7 relational surface deferred. | **S3** |
 | **4. VOPR** ✅ | §9 | one `Oracle`/`Defect` abstraction (invariant · divergence; crash/`.trap` deferred to the build-mode/process boundary); seeded pluggable `Generator`; fault/timing injection (within-stage exec permutation + snapshot-cadence round-trip — none may change the per-tick hash) with first-tick bisection; kind-locked delta-debug minimization; provenance re-run (`causeChain`) on a hit; `sweep` a pure function of a seed range (the §13 sharding seam). Capstone: an undeclared-write system is caught/bisected/minimized/explained; the correct twin → zero defects. | reuses step/runScheduled/snapshot/digest/Recorder |
 | **5. Query surface** ✅ | §7 | minimalist hand-canonicalized relations (`component/3`, `event/5`, `caused_by/2`, `system/3`, `diverge/3`) + the 4 canonical shapes (Why/What-affects-X/Where-broke/Reachability) over a uniform `Value` substrate; self-describing catalog (`relation_schema`/`relation_column`); reflection from §4 access sets (never drifts); GKZQ1/GKZR1 serializable wire codec (the socket transport is Phase-9/S7). | **S5** |
-| **6. Specs / invariants / properties** | §8 | state invariants; temporal/LTL properties over the trace; intent-metrics over agent runs. | **S8** |
+| **6. Specs / invariants / properties** ✅ | §8 | state invariants (the `fn(*const World)?Entity` shape, every-tick `checkAll` + VOPR `invariantOracle`); a CLOSED set of seven temporal combinators (always/eventually/stable/monotonic_unless/until/precedes/responds) folded over an O(T) projected-scalar `Trace` (bounded-trace/LTLf, witness-pinning); integer intent-metrics + sweep aggregate; the fun-oracle boundary as a TYPE distinction (checks→`?Violation`, metrics→`i64`, intent exogenous). Violations ride the §4 Defect (additive `.temporal` kind) through sweep→minimize→provenance and surface as the §7 `spec`/`violation` relations. | **S8** |
 | **7. Agent harnesses & evaluation** | §10 | `observe(State)->Input` policies (scripted/search/learned); mass faster-than-realtime evaluation; aggregate intent-metrics. NN inference is the *player*, not the *world*. | reuses Input channel |
 | **8. Hot-reload & migration** | §12 | `dlopen`/`dlclose` of native systems (state stays in columns); version-tagged pure `World→World` schema migrations dispatched on `schema_version` + per-Kind fingerprint. | **S6** |
 | **9. Process model & control plane** | §13 | one-OS-process-per-sim; supervisor pool (spawn/monitor/restart/harvest); query server multiplexing live sims; forks from snapshot + diverged input. | **S7** |
@@ -503,3 +506,79 @@ Bonus catches fixed during implementation (before review): a `buildForks` double
 world that `buildRun` consumes) surfaced by the OOM sub-gate, and a dangling column-name borrow in
 `readResult` (decoded `schema.names` borrowed the caller's reader buffer) — names are now owned in the
 result's arena.
+
+---
+
+## 9. Phase 6 design — §8 specs/invariants/properties (decision of record, from the design judge-panel)
+
+5-architect / 5-lens judge panel + synthesis. **Spine = the minimalist closed-combinator spec layer** (judge winner on
+determinism=90 and scope_realism=88: almost no NEW determinism surface — invariants reuse the verified
+`fn(*const World(R)) ?Entity` shape, temporal checks are auditable ascending-tick folds, metrics are integer-only,
+the every-tick hook is `*const`-borrow-only and `runtime_safety`-gated so on==off is bit-identical by construction).
+**Rejected:** the full-LTL AST as the temporal representation (scope_realism=42 — a logic engine, not one phase;
+witness-descent over nested operators an unproven determinism hazard) — but its **atom layer is kept**; and the
+full-component-per-tick Frame trace (memory blowup over a sweep). **Four grafts onto the spine:** (1) a single **O(T)
+forward-replay projected-scalar `Trace`** (one replay feeds every combinator + metric; cheaper than per-property O(T²)
+`worldAt`) storing only `[]i64`/`[]bool` probe columns + at most one optional `EventLog`; (2) a **named-`Atom` leaf
+substrate + multi-entity `Witness`** so "no two solids overlap … the entities involved" can pin plural entities and the
+canonical examples are honest compositions; (3) a self-describing **`spec` §7 relation** alongside **`violation`** so an
+AI enumerates declared intent the way it bootstraps the schema catalog; (4) a gate assertion that the `Trace`'s per-tick
+projection digests equal `run.hashes` AND `captureStream`'s certified stream — turning the one silent trace-rerun
+assumption into a hard cross-build tripwire.
+
+**Decisions:** temporal = a CLOSED set of **seven combinators** (`always`/`eventually`/`stable`/`monotonic_unless`/
+`until`/`precedes`/`responds`) as hand-written deterministic folds — NO parser/AST/automaton (the `Combinator` enum is
+non-exhaustive `_` so a future bounded-trace `composite` AST arm is additive over the same `Trace` fold + `Witness`).
+Both SPEC canonical examples are covered exactly (`stable`=boss-stays-dead; `monotonic_unless`=score-never-drops-except-
+Penalty). The **fun-oracle boundary is a TYPE distinction**: checks return `?Violation` (the engine GUARANTEES a
+verdict → a `Defect`); metrics return an integer scalar (the engine MEASURES, never judges; a metric becomes checkable
+only when a human/agent EXOGENOUSLY declares a bound). Violations integrate via an **additive `Defect.Kind.temporal`**
+(both `Defect.Kind` and `RelId` are non-exhaustive, so nothing renumbers and the Phase-1..5 pinned digests are
+untouched) flowing through `sweep→minimize→provenance` for free; `monotonic_unless`'s `EventLog` comes from a single
+`provenanceRerun`-style Recorder rerun whose per-tick hashes the gate asserts == `run.hashes`. The every-tick Debug/Safe
+`checkAll` hook is **optional** (oracle.invariant already checks every tick on demand) — the scope risk-valve.
+
+**Modules (`src/spec/`), build order:** `atom.zig` (`Atom`/`AtomHit`/`Witness` + built-in `rangeI`/`referencedLive`/
+`noOverlap`/`entityLive`); `invariant.zig` (`Invariant` + `invariantOracle` wrapping the unchanged `oracle.invariant`
++ `firstViolation` delegating to `firstTickWhere`); `defect.zig` (the additive `.temporal` `Kind`/`Detail` arm in
+`vopr/oracle.zig` + `violationToDefect`); `check.zig` (`checkAll` under `if (std.debug.runtime_safety)`); `trace.zig`
+(the O(T) projected-scalar `Trace` + optional Recorder-rerun log + the `run.hashes` cross-check); `temporal.zig` (the
+seven combinator folds + `temporalOracle`); `metric.zig` (`Metric`/`Aggregate`/`measureRun`/`aggregate` integer-only +
+optional `metricBound`); `relations.zig` (the `spec` + `violation` §7 producers + 2 `CATALOG` entries); `spec.zig`
+(umbrella + `oracles()` for the VOPR) + `root.zig` wiring + the optional `step.runScheduled` hook; `gate.zig` (the
+cross-build gate). **Phase-6 gate:** exact-(tick,witness) catch for an invariant + both canonical temporals + a
+two-entity `noOverlap`; satisfying twins clean; pinned `violation`/`spec` GKZR1 digests + a pinned metric scalar/Aggregate
+across 3 modes; the **checks-on==off + Trace==run.hashes hash-invariance sub-gate**; a temporal Defect through
+`sweep→minimize→provenance`; OOM-injection leak-freedom. **Deferred behind seams:** richer LTL (composite AST arm /
+Phase-9 text front-end), agent-driven metrics (the `Run(R)`/`Generator` boundary — Phase 7), socket serving of the
+relations (Phase 9), a stateful `SpecEngine` facade, kernel-chosen intent (never — exogenous).
+
+### Phase 6 notes (from the Phase-6 adversarial review — 9/10 confirmed, no critical/high; all fixed)
+
+22. **`errdefer`-on-`buildRun`-consumed-world double-free in test helpers** (MEDIUM+LOW, fixed). Five spec
+    test helpers (`invariant.zig` ×2, `metric.zig` ×2, `trace.zig` `mkRun`) held an `errdefer
+    w0.deinit(gpa)` that was still active when `buildRun` consumed `w0` — so a *future* failing `try`
+    (e.g. an `expectEqual` mismatch or an injected OOM) would double-free the world `buildRun` already
+    owns, crashing the runner and masking the real failure. The exact trap `query/gate.zig`'s `buildForks`
+    documents; fixed by the same pattern (a `blk:`-scoped construction errdefer that ends before
+    `buildRun`, or dropping the errdefer where the world is already cleanly constructed). Test-only, latent
+    — no production/determinism impact. *(MS-1, MS-2.)*
+23. **`responds` window overflow = a D2 build-mode divergence** (fixed). `t + prop.within` (both `u64`)
+    overflows for a huge `within`, which TRAPS in Debug/ReleaseSafe but WRAPS in ReleaseFast — exactly the
+    "determinism must not depend on safety checks" rule. Now a saturating add `t +| prop.within` (clamped
+    to T anyway), build-mode-identical. *(CS-1 / zig016-1.)*
+24. **Atom field→`i64` cast hardened** (fixed). `rangeI`/`noOverlap`/`fieldLE`/`scalarField` `@intCast` a
+    component field to `i64`; a `u64` field with the high bit set would trap (Debug/Safe) / be UB
+    (ReleaseFast) — another D2 hazard. A comptime `assertI64Field` guard now makes over-wide / non-integer
+    fields a COMPILE error, so the cast is provably trap-free. *(zig016-2.)*
+25. **Test/doc hardening** (fixed). The VOPR-flow gate now asserts minimization actually ran (6→5 ticks,
+    not just that a defect was found); a negative `Trace.build` test perturbs a `run.hashes` entry and
+    asserts `error.TraceDiverged` (proving the load-bearing cross-check fires); the `until` strong-release
+    (`q` never holds) bounded-trace branch is now tested; and `precedes`'s doc is corrected to "p at OR
+    THE SAME tick" (a same-tick `p` satisfies precedence — the code was right, the comment overstated).
+    *(TG-1/2/3, CS-2.)*
+
+Dismissed (1): a claim that the VOPR-flow re-anchor assertion is vacuous because the temporal fixture's
+failing tick (5) doesn't move under minimization — correct observation, but the assertion is valid and the
+tick-MOVING re-anchor case is already covered by the Phase-4 provenance regression on the shared
+minimize/provenance machinery a temporal Defect rides unchanged.

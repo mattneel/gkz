@@ -29,6 +29,11 @@ pub const RelMeta = struct { rel_id: RelId, name: []const u8, schema: Schema };
 pub const RELATION_SCHEMA_SCHEMA = Schema.make(&.{ .{ "rel_id", .u }, .{ "name", .bytes }, .{ "arity", .u } });
 pub const RELATION_COLUMN_SCHEMA = Schema.make(&.{ .{ "rel_id", .u }, .{ "col_index", .u }, .{ "col_name", .bytes }, .{ "term_tag", .u } });
 
+// §8 (Phase 6) relation schemas (the producers live in spec/relations.zig; schemas declared here so the
+// catalog can list them, keeping the comptime drift tripwire — one CATALOG entry per RelId — satisfied).
+pub const SPEC_SCHEMA = Schema.make(&.{ .{ "spec_id", .u }, .{ "category", .u }, .{ "name", .bytes } });
+pub const VIOLATION_SCHEMA = Schema.make(&.{ .{ "kind", .u }, .{ "seed", .u }, .{ "tick", .tick }, .{ "oracle", .bytes }, .{ "entity", .entity }, .{ "witness", .entity } });
+
 /// Every relation the surface exposes, in canonical `RelId` order. Schemas are the producer constants.
 pub const CATALOG = [_]RelMeta{
     .{ .rel_id = .component, .name = "component", .schema = relations.COMPONENT_SCHEMA },
@@ -38,6 +43,8 @@ pub const CATALOG = [_]RelMeta{
     .{ .rel_id = .diverge, .name = "diverge", .schema = relations.DIVERGE_SCHEMA },
     .{ .rel_id = .relation_schema, .name = "relation_schema", .schema = RELATION_SCHEMA_SCHEMA },
     .{ .rel_id = .relation_column, .name = "relation_column", .schema = RELATION_COLUMN_SCHEMA },
+    .{ .rel_id = .spec, .name = "spec", .schema = SPEC_SCHEMA },
+    .{ .rel_id = .violation, .name = "violation", .schema = VIOLATION_SCHEMA },
 };
 
 comptime {
@@ -109,13 +116,13 @@ test "relation_schema lists every relation with correct name + arity in canonica
     var r = try schemaRel(gpa);
     defer r.deinit(gpa);
     try testing.expectEqual(CATALOG.len, r.rows.items.len);
-    // canonical: rel_id ascending -> component(0) first, relation_column(6) last
+    // canonical: rel_id ascending -> component(0) first, violation(8) last (§8 relations appended)
     try testing.expectEqual(@as(u64, 0), r.rows.items[0].vals[0].u);
     try testing.expectEqualStrings("component", r.bytesOf(r.rows.items[0].vals[1].bytes));
     try testing.expectEqual(@as(u64, 3), r.rows.items[0].vals[2].u); // component arity 3
     const last = r.rows.items[r.rows.items.len - 1];
-    try testing.expectEqualStrings("relation_column", r.bytesOf(last.vals[1].bytes));
-    try testing.expectEqual(@as(u64, 4), last.vals[2].u); // relation_column arity 4
+    try testing.expectEqualStrings("violation", r.bytesOf(last.vals[1].bytes));
+    try testing.expectEqual(@as(u64, 6), last.vals[2].u); // violation arity 6
 }
 
 test "relation_column lists every column (rel_id, index, name, tag) in canonical order" {

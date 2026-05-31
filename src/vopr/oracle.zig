@@ -24,7 +24,10 @@ const Sys = schedule.Sys;
 pub fn Defect(comptime R: type) type {
     _ = R;
     return struct {
-        pub const Kind = enum(u8) { invariant, divergence, trap, _ };
+        // `temporal` (§8 temporal-property violation) is appended before `_` so existing variants never
+        // renumber and the Phase-1..5 pinned digests are untouched (the enum was designed non-exhaustive
+        // for exactly this). A temporal Defect rides sweep/minimize/provenance like any other kind.
+        pub const Kind = enum(u8) { invariant, divergence, trap, temporal, _ };
         /// Decoupled from Kind (NOT a union(Kind)) — a plain payload describing the location.
         pub const Detail = union(enum) {
             none,

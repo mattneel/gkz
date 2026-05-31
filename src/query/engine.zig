@@ -142,7 +142,7 @@ test "evaluate dispatches each arm to the expected relation" {
         .{ Query(Game){ .event = .{} }, term.RelId.event, @as(usize, 1) },
         .{ Query(Game){ .systems_all = {} }, term.RelId.system, @as(usize, 2) },
         .{ Query(Game){ .what_writes = 10 }, term.RelId.system, @as(usize, 1) }, // wPV writes Position
-        .{ Query(Game){ .schema = {} }, term.RelId.relation_schema, @as(usize, 7) },
+        .{ Query(Game){ .schema = {} }, term.RelId.relation_schema, @as(usize, 9) }, // 7 §7 + spec + violation
     }) |case| {
         var r = try eng.evaluate(gpa, case[0]);
         defer r.deinit(gpa);

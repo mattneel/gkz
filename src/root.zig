@@ -106,6 +106,13 @@ pub const reach = query_engine.reach;
 pub const query_wire = @import("query/wire.zig");
 pub const query_gate = @import("query/gate.zig");
 
+// --- Phase 6: specifications, invariants & properties (SPEC §8) ---
+pub const spec = @import("spec.zig");
+pub const Invariant = spec.Invariant;
+pub const Property = spec.Property;
+pub const Metric = spec.Metric;
+pub const Trace = spec.Trace;
+
 /// Bring-up placeholder so the scaffold `main.zig` keeps compiling during Phase 1. Replaced by a real
 /// kernel demo once `step`/`snapshot`/`replay` land.
 pub fn printAnotherMessage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -148,4 +155,5 @@ test {
     _ = query_engine;
     _ = query_wire;
     _ = query_gate;
+    _ = spec;
 }

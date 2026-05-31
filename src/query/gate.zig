@@ -191,8 +191,8 @@ pub const QUERY_CAUSEDBY_DIGEST: u64 = 0x7a3c8ea327fb2739;
 pub const QUERY_WHY_DIGEST: u64 = 0x53fb69bac6f69ebf;
 pub const QUERY_SYSTEM_DIGEST: u64 = 0x70655d5a2fe151e5;
 pub const QUERY_DIVERGE_DIGEST: u64 = 0xfa6944c9c9b50740;
-pub const QUERY_SCHEMA_DIGEST: u64 = 0xdfb63fa01a5dff15;
-pub const QUERY_COLUMN_DIGEST: u64 = 0xc1790c5baff469a5;
+pub const QUERY_SCHEMA_DIGEST: u64 = 0x2561d636c8582012;
+pub const QUERY_COLUMN_DIGEST: u64 = 0x9de812ed4aa09afb;
 
 /// Compute the eight fixture digests (the canonical, non-scrambled fixture). Caller frees nothing.
 fn fixtureDigests(gpa: Allocator) ![8]u64 {

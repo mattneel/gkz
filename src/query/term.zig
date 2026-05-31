@@ -142,6 +142,10 @@ pub const RelId = enum(u16) {
     diverge,
     relation_schema,
     relation_column,
+    // §8 (Phase 6) relations — appended before `_` so the §7 relations never renumber (their GKZR1
+    // digests are unchanged); the catalog relations grow to list these, which is expected.
+    spec,
+    violation,
     _,
 };
 
