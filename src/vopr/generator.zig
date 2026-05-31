@@ -47,7 +47,7 @@ pub fn scriptedGen(comptime R: type, spec: *const ScriptedSpec) Generator(R) {
             // tick is 1-based (tick N is produced before the Nth step); index by tick-1.
             const idx = tick - 1;
             if (idx >= s.inputs.len) return null;
-            const src = s.inputs[idx];
+            const src = s.inputs[@intCast(idx)]; // idx < len (a usize) here → safe; needed on 32-bit (usize=u32)
             const cmds = try gpa.dupe(input.Command, src.commands);
             return input.Input{ .tick = tick, .commands = cmds };
         }

@@ -44,15 +44,15 @@ pub const Trace = struct {
 
     /// Whether atom `atom_id` holds at tick `t` (1-based).
     pub fn holds(self: *const Self, atom_id: usize, t: u64) bool {
-        return self.holds_col[atom_id * self.ticks + (t - 1)];
+        return self.holds_col[atom_id * self.ticks + @as(usize, @intCast(t - 1))];
     }
     /// Atom `atom_id`'s scalar at tick `t` (1-based).
     pub fn scalar(self: *const Self, atom_id: usize, t: u64) i64 {
-        return self.scalar_col[atom_id * self.ticks + (t - 1)];
+        return self.scalar_col[atom_id * self.ticks + @as(usize, @intCast(t - 1))];
     }
     /// Atom `atom_id`'s witness at tick `t` (1-based) — the entities it implicated at that tick.
     pub fn witnessAt(self: *const Self, atom_id: usize, t: u64) atom.Witness {
-        return self.witness_col[atom_id * self.ticks + (t - 1)];
+        return self.witness_col[atom_id * self.ticks + @as(usize, @intCast(t - 1))];
     }
     pub fn len(self: *const Self) usize {
         return self.ticks;

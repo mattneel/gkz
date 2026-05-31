@@ -36,7 +36,8 @@ pub fn build(b: *std.Build) void {
     // proves the per-tick state hash is bit-identical across build modes (SPEC §2.2, PLAN.md D2) —
     // including under integer overflow, which ReleaseFast does not panic on. fpz is built in the
     // matching mode in each row (its own contract guarantees the three agree, so this also exercises
-    // that). A big-endian (qemu) row is left as future work (PLAN.md §7 risk #7).
+    // that). The CROSS-ARCHITECTURE axis (SPEC §2 "every architecture", incl. big-endian) is the
+    // separate `zig build cross` gate below — formerly PLAN §7 risk #7, now closed.
     //
     // Phase 8 adds, per mode, a REAL dlopen reload gate: two systems compiled to actual shared objects
     // (linkage=.dynamic) that reload_gate.zig opens via std.DynLib, proving a loaded .so's per-tick stream
@@ -135,6 +136,63 @@ pub fn build(b: *std.Build) void {
             const pgate_run = b.addRunArtifact(pgate_t);
             pgate_run.has_side_effects = true; // never cache-skip a spawn gate
             test_step.dependOn(&pgate_run.step);
+        }
+    }
+
+    // --- `zig build cross`: the CROSS-ARCHITECTURE determinism gate (SPEC §2 "every architecture") ---
+    //
+    // The base `test` gate proves Debug==ReleaseSafe==ReleaseFast on the host (x86-64, little-endian).
+    // SPEC §2 claims the per-tick state hash (and every frozen pin) is bit-identical on EVERY architecture.
+    // This step proves it: cross-compile the WHOLE root suite and re-check every pin under qemu-user on two
+    // foreign targets that span the two axes that could break it —
+    //   * aarch64-linux — a different ISA / codegen / alignment, still little-endian.
+    //   * s390x-linux   — BIG-ENDIAN: the decisive witness that the canonical little-endian serialize/hash
+    //                     path is actually honored. Any native-byte-order leak diverges a pin here.
+    // The root test module links no libc, so each foreign test binary is a STATIC ELF qemu-user runs
+    // directly (no glibc runtime path needed). We invoke it with NO `--listen` (addSystemCommand, not
+    // addRunArtifact), so the default test runner self-runs and its exit code gates the build. The
+    // root-reachable tests touch no fixed socket/temp path (the §13 socket/subprocess gates are SEPARATE
+    // artifacts, not pulled in here), so the cross runs are safe to execute concurrently.
+    //
+    // Requires `qemu-<arch>` on PATH (Debian/Ubuntu: `apt install qemu-user`). Kept a SEPARATE step (not
+    // folded into `zig build test`) because qemu emulation is ~10-20x slower; run it before a release / in
+    // CI. Absent qemu, the step fails loudly when invoked (never a vacuous pass).
+    // enable_qemu lets `addRunArtifact` execute a FOREIGN test binary by wrapping it with `qemu-<arch>`,
+    // using the build system's binary test-IPC protocol (not 306 lines of stdout through a captured pipe,
+    // which proved flaky under emulation). Foreign-execute failure (qemu missing) is a hard error here, so
+    // the gate never passes vacuously. Harmless globally: the host-targeted `test`/reload/proc artifacts
+    // are not foreign, so this changes nothing for `zig build test`.
+    b.enable_qemu = true;
+    const cross_step = b.step("cross", "Cross-arch determinism gate: re-check every pin on 4 foreign arches (the {32,64}-bit × {LE,BE} matrix) under qemu, all 3 modes");
+    // The four quadrants of {word size} × {endianness}, so every frozen pin is re-checked against a
+    // different ISA, both byte orders, AND both pointer widths (x86-64 = the native 64-bit LE baseline):
+    //   aarch64 = 64-bit LE · s390x = 64-bit BE · arm = 32-bit LE · mips = 32-bit BE.
+    // s390x/mips are the canonical-LE-serialization witnesses; arm/mips are the fixed-width (no-usize-leak)
+    // witnesses. qemu binary names (qemu-aarch64/s390x/arm/mips) are derived from the arch by Zig.
+    const cross_arches = [_]std.Target.Cpu.Arch{ .aarch64, .s390x, .arm, .mips };
+    // The cross-compiles run in parallel; the qemu RUNS are CHAINED to run one at a time so the emulated
+    // thread spawns of the step_par tests (forced-overlap + the 16× repeated run) don't oversubscribe the
+    // host across six concurrent suites. Cheap (~30s total) insurance for a reliable gate.
+    var prev_cross_run: ?*std.Build.Step = null;
+    for (cross_arches) |arch| {
+        const ctq = b.resolveTargetQuery(.{ .cpu_arch = arch, .os_tag = .linux });
+        for (modes) |mode| {
+            const xfpz = b.dependency("fpz", .{ .target = ctq, .optimize = mode });
+            const xmod = b.createModule(.{
+                .root_source_file = b.path("src/root.zig"),
+                .target = ctq,
+                .optimize = mode,
+            });
+            xmod.addImport("fpz", xfpz.module("fpz"));
+            const xt = b.addTest(.{ .name = b.fmt("cross-{s}-{s}", .{ @tagName(arch), @tagName(mode) }), .root_module = xmod });
+            const xrun = b.addRunArtifact(xt); // foreign → auto-wrapped with qemu-<arch> (enable_qemu); test IPC
+            // The wall-clock overlap proofs (step_par_gate T6/T9) self-skip on the foreign targets (they're
+            // a native-host property; see `timing_reliable` there). This gate proves cross-arch DETERMINISM
+            // — every frozen pin + threaded determinism — which is robust under emulation.
+            xrun.has_side_effects = true; // never cache-skip the cross-arch determinism gate
+            if (prev_cross_run) |p| xrun.step.dependOn(p); // serialize the qemu runs (see above)
+            prev_cross_run = &xrun.step;
+            cross_step.dependOn(&xrun.step);
         }
     }
 }

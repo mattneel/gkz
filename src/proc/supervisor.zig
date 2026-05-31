@@ -157,7 +157,7 @@ pub fn Supervisor(comptime T: type) type {
         pub fn runSweep(self: *Self, seed_lo: u64, seed_hi: u64, n_shards: u64, max_ticks: u64, metric_id: u16) !SweepResult {
             std.debug.assert(n_shards >= 1);
             // build all job bytes (owned here; borrowed by runJobs for the call)
-            var jobs = try self.gpa.alloc(ShardJob, n_shards);
+            var jobs = try self.gpa.alloc(ShardJob, @as(usize, @intCast(n_shards)));
             var built: usize = 0;
             defer {
                 for (jobs[0..built]) |sj| self.gpa.free(sj.bytes);

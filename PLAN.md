@@ -278,8 +278,9 @@ pub const Snapshot = struct { bytes: []u8, tick: u64, hash: u64, crc: u32 };
     two constants in `replay.zig` — the end-to-end final-state hash **and** a rolling digest over the
     per-tick hash stream — asserted identically in every mode; all three modes passing therefore proves
     `Debug == ReleaseSafe == ReleaseFast` for both the final state and the full per-tick stream (D2).
-    Includes the deliberate-overflow (`addSat`) divergence test. *(Implemented; a big-endian qemu row
-    remains future work — §7 risk #7.)*
+    Includes the deliberate-overflow (`addSat`) divergence test. *(Implemented. The cross-ARCHITECTURE
+    axis — formerly "a big-endian qemu row remains future work" — is now the `zig build cross` gate: every
+    pin re-checked under qemu on aarch64/s390x/arm/mips, the full {32,64}-bit × {LE,BE} matrix. See §14.)*
 
 ### Determinism test plan (the gates)
 
@@ -1182,3 +1183,62 @@ Gate target: **+16 in-process thread gate tests per mode** (Debug/ReleaseSafe/Re
 3. **MEDIUM — the genuine-overlap witness used a read-only, RNG-free, record-free workload (fixed by T9).** The data-bearing concurrent path is now force-overlapped (see #1).
 4. **LOW (fixed):** the parallel branch now validates `exec` is a stage-GROUPED permutation in safe builds (a malformed exec would escalate to a data race, unlike the serial path's benign wrong result); `mergeSubLogs` now runs BEFORE the drain (recording precedes the drain, mirroring the spine); T4's set gained a 2-emit-with-explicit-cause system (witnesses the per-sub-recorder `cur_sa` dedup + a multi-element cause list through the merge) and a zero-emit system (witnesses an empty sub-log contributes nothing); T5 now pins the permuted-exec MERGED LOG (not just the world hash); **T10** witnesses a system fault is SURFACED in ascending-sid order (not swallowed by `group.async`'s `catch {}`); **T11** drives `stepExecPar` through a `FailingAllocator` (clean teardown, no leak); the `n_threads` doc now states the actual overlap degree is owned by the passed `io` (`async_limit`), not `n_threads`.
 5. **Refuted (2):** "`group.await catch {}` leaves torn buffers after a swallowed `error.Canceled`" — `await` completes all member tasks before returning, so post-barrier reads are well-defined; "per-system arena stack array has no documented ceiling" — the N-sized arrays are bounded by the comptime system count exactly as the serial path's `[N]CommandBuffer` is, and the warm-loop's gpa pressure premise was factually wrong.
+
+---
+
+## 14. Cross-architecture determinism gate — SPEC §2 "every architecture" (decision of record)
+
+The base `zig build test` gate proves `Debug == ReleaseSafe == ReleaseFast` on the host (x86-64, 64-bit
+LE). SPEC §2 claims the per-tick state hash and **every** frozen pin are bit-identical on EVERY
+architecture — the premise that makes record/replay/forking exact across machines. `zig build cross`
+closes that axis: it cross-compiles the whole root suite and re-checks every pin under **qemu-user** on
+the four quadrants of {word size} × {endianness}, so each pin is verified against a different ISA, both
+byte orders, AND both pointer widths.
+
+| target | bits | endian | role |
+|---|---|---|---|
+| x86-64 | 64 | LE | the native baseline (`zig build test`) |
+| **aarch64** | 64 | LE | a different ISA / codegen / alignment |
+| **s390x** | 64 | **BE** | the canonical-LE serialization witness |
+| **arm** | 32 | LE | a 32-bit word (the no-`usize`-leak witness) |
+| **mips** | 32 | **BE** | 32-bit **and** big-endian at once (the strongest single stress) |
+
+**Result: all 304 determinism tests pass on every quadrant × 3 modes (12 qemu suites, 0 fail).** Every
+frozen digest — content hashes, the per-tick stream digest, the event-log digest, the VOPR replay
+constants, the 8 query digests, the spec/metric/violation digests, the migration images + reload-stream
+digest, and the threaded step_par pins — is byte-identical across all of them.
+
+**Why the big-endian / 32-bit pass is PRINCIPLED, not lucky** (an endian/word-size audit — 39 agents,
+clean bill of health). The hashed/serialized path is fixed-width and canonical-LE BY CONSTRUCTION:
+`serialize.putInt`/`getInt` derive byte count from `@typeInfo(T).int.bits` and emit an explicit LE byte
+loop — never `@bitCast`/`asBytes`/native-endian, never `@sizeOf(usize)`. Every length/count/mask is
+`@intCast` to an explicit `u16`/`u32`/`u64` before it hits the wire; the presence mask is widened to a
+fixed `u64`; `hashWorld` reads only codec bytes (never native SoA/struct layout); D7 (no float) and D8
+(no pointer) are `@compileError`-enforced in `registry.assertSerializable`. So no host-endian or
+word-width value ever reaches a hashed byte.
+
+**Implementation notes / decisions:**
+- `build.zig` sets `b.enable_qemu = true` and uses `addRunArtifact` on the foreign test (Zig auto-wraps
+  with `qemu-<arch>` and uses the binary test-IPC protocol). An earlier `addSystemCommand` + self-run
+  approach proved flaky — the 306-line stdout through a captured pipe intermittently SIGPIPE'd under
+  emulation. The root test module links no libc, so each foreign binary is a static ELF qemu runs
+  directly. Missing qemu is a hard error (`failing_to_execute_foreign_is_an_error` default) — never a
+  vacuous pass. The qemu runs are CHAINED (serialized) so the emulated thread spawns of the step_par
+  tests across many suites don't oversubscribe the host; kept SEPARATE from `zig build test` because
+  qemu is ~10-20× slower.
+- The wall-clock OVERLAP proofs (`step_par_gate` T6/T9) self-skip on the foreign targets
+  (`timing_reliable = builtin.cpu.arch == .x86_64`): overlap is a host-runtime property, unreliable under
+  emulation, and already proven natively. The cross gate re-checks DETERMINISM (the pins) + threaded
+  determinism (T1–T5), which are robust under emulation — so each foreign suite reports 304 pass / 2 skip.
+- The gate surfaced **5 genuine 32-bit portability bugs** (u64 values indexing slices / sizing an alloc,
+  which only fail when `usize`=u32) in `vopr/generator.zig`, `spec/trace.zig`, `proc/supervisor.zig` —
+  fixed with behavior-preserving `@intCast` (identity on 64-bit). gkz now compiles AND runs bit-identically
+  on 32-bit.
+- The fixed-width invariant is now STRUCTURAL: `serialize.assertFixedWidth` (`comptime` in
+  `putInt`/`getInt`) `@compileError`-rejects `usize`/`isize`, so a future pointer-width field is a
+  compile error rather than a silent 32-bit divergence — the audit's belt-and-suspenders fix (b),
+  complementing the empirical gate (fix a).
+
+**Residual scope:** 64-bit big-endian (s390x) + 32-bit both-endian (arm/mips) cover the realistic matrix.
+Other targets (riscv64, ppc64, wasm) are reachable the same way (add the arch to `cross_arches`) but add
+no new {wordsize,endian} quadrant. SIMD vs scalar (§7 risk #7) remains a separate axis once SIMD lands.

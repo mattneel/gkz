@@ -18,7 +18,9 @@ is justified by one of those two jobs.
 > properties** (§8), **agent harnesses & evaluation** (§10), **hot-reload & schema migration** (§12), and
 > the **process model & control plane** (§13): one-process-per-sim supervision with real cross-process
 > determinism, sharded sweeps over worker processes, crash-as-repro harvesting, and a query server. The
-> kernel runs headless, end-to-end, with zero art, bit-identically across Debug/ReleaseSafe/ReleaseFast.
+> kernel runs headless, end-to-end, with zero art, bit-identically across Debug/ReleaseSafe/ReleaseFast —
+> and, verified under qemu, byte-identically across architectures: aarch64, s390x (big-endian), and 32-bit
+> arm/mips (`zig build cross`).
 > See [`PLAN.md`](./PLAN.md) for the full roadmap and [`SPEC.md`](./SPEC.md) for the design contract.
 
 ---
@@ -52,6 +54,7 @@ automatically on first build).
 
 ```sh
 zig build test     # run the full suite under Debug + ReleaseSafe + ReleaseFast (the determinism gate)
+zig build cross    # CROSS-ARCH gate: re-check every pin under qemu on aarch64/s390x/arm/mips (needs qemu-user)
 zig build run      # build and run the CLI
 zig build          # build the CLI to zig-out/bin/gkz
 ```
@@ -64,6 +67,16 @@ merged-log pins (the Phase-2b cross-build witness) — asserted identically in e
 ReleaseFast` bit-identity: under integer overflow (which ReleaseFast does not trap), across permuted
 system execution order, whether or not events are recorded, regardless of physical table/log layout, and
 with invariant checks compiled in or out.
+
+`zig build cross` extends that proof to **SPEC §2's "every architecture"** claim: it cross-compiles the
+whole suite and re-checks every pin under qemu-user on the four quadrants of {word size} × {endianness} —
+**aarch64** (64-bit LE), **s390x** (64-bit **big-endian**), **arm** (32-bit LE), and **mips** (32-bit
+**big-endian**) — all 3 modes. Every digest is byte-identical on all of them. This is a real witness, not
+a hope: the codec is fixed-width canonical-LE by construction (`putInt`/`getInt` derive width from the
+type's declared bits and emit an explicit LE byte loop; `usize`/`isize` on the wire is a compile error;
+no `@bitCast`/native-endian/`@sizeOf(usize)` ever reaches a hashed byte), and an endian/word-size audit
+confirmed it. The big-endian + 32-bit runs are what make recording, replay, and forking exact *across
+machines of any architecture* — the headless-first thesis.
 
 ---
 

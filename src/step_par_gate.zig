@@ -36,6 +36,16 @@ const input = @import("input.zig");
 const serialize = @import("serialize.zig");
 
 const testing = std.testing;
+
+/// The wall-clock OVERLAP proofs (T6/T9) are a host-runtime property, NOT an architecture-determinism
+/// property: they measure that concurrent work executes simultaneously. Under the cross-arch gate
+/// (`zig build cross`) the foreign targets run EMULATED in qemu (and several suites run at once), where
+/// wall-clock timing is unreliable. So those two tests run only on the native x86-64 host (where they
+/// were designed and validated); the cross gate still re-checks all the DETERMINISM pins + threaded
+/// determinism (T1–T5, T10, T11) on every architecture. The native build IS x86-64 (`b.standardTarget`),
+/// so this never skips the overlap proof on the real gate.
+const timing_reliable = builtin.cpu.arch == .x86_64;
+
 const Read = query.Read;
 const Write = query.Write;
 const Query = query.Query;
@@ -447,6 +457,7 @@ test "T5: order-permutation under threads — within-stage permutation yields id
 
 test "T6: ACTUAL overlap — a wide read-only stage runs concurrently, robust to core count" {
     if (builtin.single_threaded) return error.SkipZigTest; // no threads to overlap — honest skip (§13.6)
+    if (!timing_reliable) return error.SkipZigTest; // foreign/emulated build (the cross-arch gate) — see below
     const gpa = testing.allocator;
     const io = std.testing.io;
     gate_io = io;
@@ -464,6 +475,7 @@ test "T6: ACTUAL overlap — a wide read-only stage runs concurrently, robust to
 
 test "T9: DATA-BEARING overlap — concurrent disjoint-column writes + RNG + emit overlap AND stay race-free" {
     if (builtin.single_threaded) return error.SkipZigTest;
+    if (!timing_reliable) return error.SkipZigTest; // foreign/emulated build (the cross-arch gate) — see T6
     const gpa = testing.allocator;
     const io = std.testing.io;
     gate_io = io;

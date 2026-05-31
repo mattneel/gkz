@@ -96,9 +96,21 @@ pub fn serializedSizeOf(comptime T: type) usize {
     };
 }
 
+/// Refuse to encode/decode a POINTER-WIDTH integer. `usize`/`isize` are the host word width
+/// (`@typeInfo(usize).int.bits` is 64 on a 64-bit target, 32 on a 32-bit one), so serializing one would
+/// emit a different number of bytes per architecture and break cross-architecture bit-identity (SPEC §2,
+/// proven by `zig build cross`). The codec is fixed-width BY CONSTRUCTION; this makes that invariant
+/// structural — a future `usize`/`isize` on the wire is a compile error, not a silent 32-bit divergence
+/// the cross gate would otherwise have to catch. Sits alongside the D7 (float) / D8 (pointer) guards in
+/// registry.assertSerializable. Cast to an explicit fixed-width int (u16/u32/u64/i64/…) at the call site.
+inline fn assertFixedWidth(comptime T: type) void {
+    comptime if (T == usize or T == isize) @compileError("serialize: refusing to encode pointer-width int '" ++ @typeName(T) ++ "' — usize/isize are the host word width and would break cross-arch bit-identity (SPEC §2). Cast to a fixed-width int at the call site.");
+}
+
 /// Write an integer of any bit width as ceil(bits/8) little-endian bytes (zero-extended to the byte
 /// boundary). Inverse of `getInt`.
 pub fn putInt(sink: anytype, comptime T: type, v: T) !void {
+    comptime assertFixedWidth(T);
     const bits = @typeInfo(T).int.bits;
     const nbytes = (bits + 7) / 8;
     const UB = std.meta.Int(.unsigned, bits);
@@ -110,6 +122,7 @@ pub fn putInt(sink: anytype, comptime T: type, v: T) !void {
 }
 
 pub fn getInt(reader: *ByteReader, comptime T: type) Error!T {
+    comptime assertFixedWidth(T);
     const bits = @typeInfo(T).int.bits;
     const nbytes = (bits + 7) / 8;
     const W = std.meta.Int(.unsigned, nbytes * 8);
