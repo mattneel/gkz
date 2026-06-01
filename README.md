@@ -27,6 +27,25 @@ is justified by one of those two jobs.
 
 ---
 
+## Using it — gkz is a library
+
+You drive gkz the way you drive any library: `@import("gkz")`, write your `Registry` + systems + specs,
+then write a Zig harness (a `main` or a `test`) that calls `step` / `snapshot` / `sweep` / `vopr` / the
+query surface, and run it with `zig build` / `zig test`. There is no CLI or protocol — an agent that can
+write and run code drives a library by writing and running code. (The `proc` control-plane/network layer
+is an *optional* operational shell for running sims at scale, not the authoring front door.)
+
+- **Worked example:** [`examples/roguelike/`](./examples/roguelike/) — the simulation core of a headless
+  grid roguelike, built as its own project that consumes gkz as a path dependency (the downstream
+  template). `zig build run` narrates the whole author's loop — step, observe, snapshot/replay, fork to
+  A/B a balance tweak, sweep a fun-proxy metric across seeds, VOPR a planted bug into a minimal repro,
+  read provenance. Copy it as a starting skeleton.
+- **Skills for AI coding harnesses:** [`.claude/skills/`](./.claude/skills/) — `gkz-overview` (what it is
+  + the determinism contract), `gkz-authoring` (write the sim core), `gkz-measure` (drive + measure the
+  loop).
+
+---
+
 ## The idea
 
 The simulation is a pure function:

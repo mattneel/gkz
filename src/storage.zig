@@ -144,6 +144,14 @@ pub fn Table(comptime R: type) type {
             return &self.column(R.indexOf(C))[row];
         }
 
+        /// Read-only sibling of `get` — returns `*const C`, callable on a `*const Table` (observing a
+        /// World outside a system without taking write access). Same invalidation rule as `get`.
+        pub fn getConst(self: *const Self, e: Entity, comptime C: type) ?*const C {
+            const row = self.rowOf(e) orelse return null;
+            if ((self.masks()[row] & R.bitOf(C)) == 0) return null;
+            return &self.columnConst(R.indexOf(C))[row];
+        }
+
         /// Set component `C` on `e` (sets the presence bit + writes the value). Total no-op if `e` is
         /// not live.
         pub fn addComponent(self: *Self, e: Entity, comptime C: type, value: C) void {

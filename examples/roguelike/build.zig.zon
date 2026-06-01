@@ -1,0 +1,20 @@
+.{
+    .name = .roguelike,
+    .version = "0.0.0",
+    .fingerprint = 0xf89cc4615dcb12a9, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+
+    // The canonical gkz example consumes the kernel exactly the way a real downstream game would:
+    // a path dependency on the gkz package one directory up. `b.dependency("gkz", …).module("gkz")`
+    // hands back the same public `gkz` module the kernel exposes (with its own `fpz` dep already wired).
+    .dependencies = .{
+        .gkz = .{ .path = "../.." },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}

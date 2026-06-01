@@ -82,8 +82,43 @@ pub fn World(comptime Reg: type) type {
         pub fn get(self: *Self, e: Entity, comptime C: type) ?*C {
             return self.table.get(e, C);
         }
+        /// Read-only `get` (`*const C`) — observe a component without taking write access, e.g. on a
+        /// `*const World` between ticks.
+        pub fn getConst(self: *const Self, e: Entity, comptime C: type) ?*const C {
+            return self.table.getConst(e, C);
+        }
         pub fn has(self: *const Self, e: Entity, comptime C: type) bool {
             return self.table.has(e, C);
+        }
+
+        /// A read-only iterator over every live entity carrying component `C`, in canonical row order —
+        /// the front door for OBSERVING a World OUTSIDE a system (a system uses a `Query` instead).
+        /// `.value` is `*const C`; pair with `getConst` to read an entity's other components. It borrows
+        /// `*const World`, so it can never perturb the hashed state.
+        pub fn ConstIter(comptime C: type) type {
+            return struct {
+                owners: []const Entity,
+                masks: []const Reg.Mask,
+                col: []const C,
+                row: usize = 0,
+                pub const Item = struct { entity: Entity, value: *const C };
+                pub fn next(it: *@This()) ?Item {
+                    while (it.row < it.owners.len) {
+                        const r = it.row;
+                        it.row += 1;
+                        if ((it.masks[r] & comptime Reg.bitOf(C)) != 0) return .{ .entity = it.owners[r], .value = &it.col[r] };
+                    }
+                    return null;
+                }
+            };
+        }
+        /// Begin a read-only iteration over live entities carrying `C` (see `ConstIter`).
+        pub fn iterate(self: *const Self, comptime C: type) ConstIter(C) {
+            return .{
+                .owners = self.table.owners(),
+                .masks = self.table.masks(),
+                .col = self.table.columnConst(comptime Reg.indexOf(C)),
+            };
         }
 
         /// Content hash (XXH64 + CRC32) of this World's canonical serialization.
@@ -136,6 +171,29 @@ test "spawn creates a live entity with a row; add/get/has work" {
     try testing.expect(w.has(e, Position));
     try testing.expectEqual(@as(i64, 2), w.get(e, Position).?.x.toInt());
     try testing.expectEqual(@as(usize, 1), w.table.rowCount());
+}
+
+test "iterate + getConst observe live entities read-only (outside a system)" {
+    const gpa = testing.allocator;
+    var w = W.init(0);
+    defer w.deinit(gpa);
+    const a = try w.spawn(gpa);
+    w.add(a, Health, .{ .hp = 7 });
+    const b = try w.spawn(gpa);
+    w.add(b, Health, .{ .hp = 9 });
+    const c = try w.spawn(gpa); // no Health — must be skipped by iterate(Health)
+
+    var sum: i32 = 0;
+    var n: usize = 0;
+    var it = w.iterate(Health); // *const World view
+    while (it.next()) |row| {
+        sum += row.value.hp;
+        try testing.expectEqual(row.value.hp, w.getConst(row.entity, Health).?.hp);
+        n += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), n); // only the two Health carriers
+    try testing.expectEqual(@as(i32, 16), sum);
+    try testing.expect(w.getConst(c, Health) == null); // absent component → null
 }
 
 test "despawn frees the handle and removes the row" {
