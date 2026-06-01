@@ -160,6 +160,17 @@ pub const stepExecPar = step_par.stepExecPar;
 pub const stepPar = step_par.stepPar;
 pub const mergeSubLogs = step_par.mergeSubLogs;
 
+// Phase 10 (§11): content as data — prefabs/levels as structured diffable records, deterministically
+// instantiated into a World; seeded proc-gen; asset handles (headless-first). See PLAN §15.
+pub const content = @import("content.zig");
+pub const Prefab = content.Prefab;
+pub const Level = content.Level;
+pub const Builder = content.Builder;
+pub const LevelBuilder = content.LevelBuilder;
+pub const loadLevel = content.loadLevel;
+pub const instantiate = content.instantiate;
+pub const localRef = content.localRef;
+
 /// Bring-up placeholder so the scaffold `main.zig` keeps compiling during Phase 1. Replaced by a real
 /// kernel demo once `step`/`snapshot`/`replay` land.
 pub fn printAnotherMessage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -185,6 +196,8 @@ test {
     _ = step_mod;
     _ = step_par;
     _ = @import("step_par_gate.zig");
+    _ = content;
+    _ = @import("content_gate.zig");
     _ = snapshot_mod;
     _ = replay_mod;
     _ = event;

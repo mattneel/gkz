@@ -10,14 +10,16 @@ Elm/Redux (state-as-value, time-travel), and `rr` (record-replay) — not the ma
 The primary user is an **AI** — authoring game logic and debugging running games. Every design choice
 is justified by one of those two jobs.
 
-> **Status:** Phases 1–9 (plus **Phase 2b**, real in-process multithreaded stage execution) are complete
+> **Status:** Phases 1–10 (plus **Phase 2b**, real in-process multithreaded stage execution) are complete
 > and verified — the foundation (the World as a value + pure
 > `step`), the deterministic scheduler (§4) now running stages **across threads** bit-identically to the
 > serial spine, events & causality (§5), the **VOPR** deterministic
 > simulator/defect-finder (§9), the **relational query surface** (§7), **specs/invariants/temporal
-> properties** (§8), **agent harnesses & evaluation** (§10), **hot-reload & schema migration** (§12), and
+> properties** (§8), **agent harnesses & evaluation** (§10), **hot-reload & schema migration** (§12),
 > the **process model & control plane** (§13): one-process-per-sim supervision with real cross-process
-> determinism, sharded sweeps over worker processes, crash-as-repro harvesting, and a query server. The
+> determinism, sharded sweeps over worker processes, crash-as-repro harvesting, and a query server — and
+> **content as data** (§11): prefabs/levels as diffable records that instantiate to a pinned World, seeded
+> proc-gen, and asset-handles-as-data. The
 > kernel runs headless, end-to-end, with zero art, bit-identically across Debug/ReleaseSafe/ReleaseFast —
 > and, verified under qemu, byte-identically across architectures: aarch64, s390x (big-endian), and 32-bit
 > arm/mips (`zig build cross`).
@@ -256,6 +258,27 @@ in-process run structurally cannot fake), a hung worker is killed by the timeout
 through the same `Executor` seam; the reload/migrate *trigger* and auth/TLS are the remaining control-plane
 refinements.
 
+### Phase 10 — Content as data (SPEC §11)
+
+| Module | Responsibility |
+|---|---|
+| `content.zig` | `Prefab(R)`/`Level(R)` as structured records (component cells = canonical-LE bytes + an explicit local-ref patch list); a `Builder`/`LevelBuilder`; deterministic `instantiate`/`loadLevel`; canonical `writePrefab`/`readPrefab`/`writeLevel`/`readLevel` with hostile-hardened decode |
+| `mutation.applyAdd` | One `kind_id`→type dispatch shared by the command-buffer drain (`.kernel`) and content instantiation (`.content`) — untrusted content can never reach the `.kernel` `catch unreachable` |
+
+A **prefab** is a reusable template of entities + component values with **local** cross-entity references;
+a **level** composes prefab instances (+ per-instance overrides) and standalone entities into a starting
+World. Instantiation spawns over the deterministic entity allocator and resolves refs, so a level's
+**loaded-World digest is a fixed pin** — across build modes *and* the cross-arch matrix. Content is
+authored as data the same way systems are authored as code (a runtime `Builder` program or a comptime
+literal — git-diffable), so **procedural generation** is just content-code emitting content-data
+(`genDungeon(seed)` → a deterministic World). A cross-entity reference is a component `Entity` field set to
+the `localRef(target)` **sentinel** (odd generation → fail-closed if a rewrite is ever missed); the builder
+emits an explicit, auditable ref-patch for each — never a blind reflection rewrite, so a same-shaped
+**asset handle** (`enum(u64)`) is left untouched. Which is the headless-first thesis made executable:
+**rendering assets are referenced by handle, and a world full of handles loads, runs, and hashes with zero
+art and no asset table.** (Mid-tick prefab spawning, ZON authoring, and asset *import* are declared
+seams/non-goals — see PLAN §15.)
+
 ### Determinism contract (the spine)
 
 `step` is pure; the World is a value; all randomness is a keyed, counter-based pure function; the
@@ -280,6 +303,8 @@ contract:
 - **Phase 7** — Agent harnesses & evaluation (§10) ✅
 - **Phase 8** — Hot-reload & schema migration (§12): real `dlopen` native-systems loading + version-tagged `World→World` migrations ✅
 - **Phase 9** — Process model & control plane (§13): one-process-per-sim supervisor pool, cross-process sweep sharding, crash-as-repro harvesting, the query server ✅
+- **Phase 10** — Content as data (§11): `Prefab`/`Level` as diffable records, deterministic instantiation (a pinned loaded-World digest, cross-arch), seeded proc-gen, asset-handles-as-data (headless-first) ✅
+- **Cross-architecture determinism gate** (`zig build cross`): every pin re-checked under qemu on aarch64/s390x/arm/mips — the {32,64}-bit × {LE,BE} matrix ✅
 - **Next** — distributing workers to **other machines** (a `NetworkExecutor` over the same job/result frames; needs a second host to gate), plus the control-plane refinements: a watch-driven reload/migrate **trigger** (into Phase 8's `SystemSource` seam) and socket auth — all behind the `Executor`/`SystemSource` seams built here
 
 See [`PLAN.md`](./PLAN.md) §6 for the full phase map.

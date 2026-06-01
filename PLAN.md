@@ -1242,3 +1242,343 @@ word-width value ever reaches a hashed byte.
 **Residual scope:** 64-bit big-endian (s390x) + 32-bit both-endian (arm/mips) cover the realistic matrix.
 Other targets (riscv64, ppc64, wasm) are reachable the same way (add the arch to `cross_arches`) but add
 no new {wordsize,endian} quadrant. SIMD vs scalar (§7 risk #7) remains a separate axis once SIMD lands.
+
+## 15. Phase 10 design — §11 content-as-data: prefabs, levels, proc-gen, asset handles (decision of record, from the design judge-panel)
+
+> Base design: **determinism-purist** (panel winner, 270; Judge #1/#2/#3 all best). Grafted: reuse-minimal's **comptime Gate #8** (offset-vs-codec consistency), ai-authoring-first's **odd-generation `localRef` sentinel** + the **`mutation.applyAdd` slice extraction**, robustness-serialization's **OOM-injection sweep** and **persisted `field_path` patches**. Every open question is resolved below.
+>
+> **AS-BUILT NOTE — read §15.15 first.** The `field_path` graft (and the `ref(field-path)` builder method / `fieldOffset` helper it implies) was **NOT built**; it is demoted to a declared v1.1 non-goal. It only matters across a §12 prefab migration (itself v1.1), and the decode-time legal-offset validator + comptime Gate #8 deliver the same fail-closed safety without it. Wherever §15.2/§15.6/§15.10/§15.11/§15.13 below describe `field_path` / `ref(path)` / `fieldOffset` as built, read §15.15: the builder derives patches from the `localRef` **sentinel-walk** instead, and §15.15 records every adversarial-review delta.
+
+### 15.1 What §11 demands, mapped to artifacts
+
+SPEC §11 has exactly three clauses: (a) entities/prefabs/levels are *structured, diffable, mergeable data, not opaque scenes*; (b) procedural generation is *content-as-code emitting content-as-data, deterministically seeded*; (c) rendering assets are *referenced by handle and not required for the sim to run* — headless-first. There is no concrete artifact in tree today. Phase 10 delivers one new module, `src/content.zig` (exported from `root.zig` as `pub const content` / `pub const Prefab` / `pub const Level` / `pub const Builder`), plus a content gate folded into the existing 3-mode + 4-arch matrix.
+
+### 15.2 Data model + exact signatures (`src/content.zig`)
+
+A template entity is **not** an `Entity`: it has no generation and no allocator state, only a dense authoring position. A distinct newtype makes a local id a compile-time-distinct type from a real handle, so the two can never be confused at a call site.
+
+```zig
+//! SPEC §11 — content as data. Prefabs/levels are structured, diffable records (NOT opaque scenes):
+//! a Prefab is a set of per-local-entity component CELLS (canonical-LE bytes, == image.KindRecord) plus
+//! an explicit local->local ref-patch list; a Level composes prefab instances + standalone nodes into a
+//! starting World. Instantiation spawns in canonical local-id order over the deterministic FIFO entity
+//! allocator, sets cells through the shared kind_id->type dispatch, then rewrites refs — so a level's
+//! loaded-World digest is a fixed pin across build modes AND the cross-arch matrix. Decode is UNTRUSTED
+//! and hostile-hardened exactly like image.decode (validate-before-alloc, never panic, never a wild write).
+
+const image = @import("migrate/image.zig");
+
+/// A reference to an entity WITHIN a prefab/level template, valid only during authoring + instantiation.
+/// `enum(u32)` so it serializes as a u32, orders trivially, and is a type DISTINCT from `Entity`.
+pub const Local = enum(u32) { _ };
+
+/// One authored component cell: kind_id + canonical-LE value bytes. ALIASED from image.KindRecord (not
+/// re-declared) so prefab cells interoperate with image.findCell/maskFor/encode for free.
+pub const Cell = image.KindRecord; // = struct { kind_id: u16, bytes: []const u8 }
+
+/// One authored entity in a template: its local id and its component cells in ascending kind_id.
+pub const Node = struct {
+    local: Local,
+    cells: []const Cell, // ascending kind_id (canonical), like image.RowRecord.comps
+};
+
+/// "Rewrite local entity `node`'s component `kind_id`, at canonical byte `byte_offset` (an 8-byte Entity
+/// leaf), to the real handle of local entity `target`." Ref-ness is a property of the PATCH, not a type.
+pub const RefPatch = struct {
+    node: Local,        // the node whose cell is patched
+    kind_id: u16,       // which component cell
+    byte_offset: u32,   // offset of the 8-byte Entity leaf WITHIN that cell's canonical bytes
+    target: Local,      // the local whose resolved real handle is written there
+    /// PERSISTED-ONLY field-index path (e.g. &.{0,2} = field 0 then array elem 2), resolved to byte_offset
+    /// at decode against the LIVE registry (migration-robust; see §15.6). Ignored on the in-memory path.
+    field_path: []const u16 = &.{},
+};
+
+/// A reusable template of one-or-more entities. NO allocator state, NO generations. `R` validates
+/// kind_ids/widths at build/decode. Instantiable many times.
+pub fn Prefab(comptime R: type) type {
+    return struct {
+        const Self = @This();
+        pub const Registry = R;
+        nodes: []const Node,     // canonical order = ascending local id
+        patches: []const RefPatch, // canonical order = ascending (node, kind_id, byte_offset)
+        arena: ?std.heap.ArenaAllocator = null, // present iff this Prefab owns its slices (builder/decoded)
+        pub fn deinit(self: *Self) void { if (self.arena) |*a| a.deinit(); self.* = undefined; }
+    };
+}
+
+/// A composition that builds one initial World: prefab instances (+ per-instance overrides) + loose nodes.
+pub fn Level(comptime R: type) type {
+    return struct {
+        const Self = @This();
+        pub const Registry = R;
+        tick0: u64 = 0,
+        schema_version: u32 = 1,
+        rng_seed: u64,                  // becomes World.rng_root.seed (hashed)
+        prefabs: []const Prefab(R),     // the prefab table placements index into
+        placements: []const Placement,  // each names a prefab + per-instance overrides
+        loose: []const Node,            // standalone entity templates (no prefab)
+        arena: ?std.heap.ArenaAllocator = null,
+        pub fn deinit(self: *Self) void { if (self.arena) |*a| a.deinit(); self.* = undefined; }
+    };
+}
+
+pub const Placement = struct { prefab_index: u32, overrides: []const Override = &.{} };
+pub const Override = struct { local: Local, cell: Cell }; // v1: REPLACE one whole cell at instantiate time
+```
+
+Local ids are dense `0..nodes.len`, assigned sequentially by the builder. Denseness is what makes the local→real map a **flat `[]Entity`**, not a hashmap — no hash-iteration order participates anywhere (a determinism hazard eliminated structurally).
+
+### 15.3 Entity-ref resolution — DECIDED: explicit ref-patches (not reflection-at-rewrite)
+
+The rewrite mechanism is **explicit `RefPatch` data**, never a reflection walk over a component's `Entity`-typed fields. This is the load-bearing decision.
+
+- **The managed-ref vs raw-data contract:** a field is a *managed ref* iff an author emits a `RefPatch` for it. The kernel uses `Entity` for *both* a managed cross-entity reference (`event.subject`, spec atoms) *and* potentially an opaque value an author wants left verbatim. Reflection would silently rewrite **all** `Entity`-shaped 8-byte windows — including raw-id data and the asset handle — corrupting them. The explicit patch makes "this is a ref" an auditable, diffable claim; the patch list literally *is* the prefab's dependency graph.
+- **Ergonomics without reflection magic:** the builder offers `b.ref(node, C, "field.path", target)`, which computes `byte_offset` **at comptime** by walking `C`'s serialized leaves in declaration order, summing `serialize.serializedSizeOf` of every preceding leaf, asserting `@FieldType` resolves to `Entity` (compile error on a typo or a non-`Entity` field). Nested structs and array elements address as a single flat `u32` (`"links.2"`). So the author writes a normal typed call; the explicit patch is *generated* from the type.
+- **Rewrite at instantiate:** after all nodes of an instance are spawned and `map: []Entity` is built, each patch overwrites the 8-byte window at `byte_offset` with `putInt(u32 index)` then `putInt(u32 generation)` of `map[target]` — byte-identical to what the codec would emit for a real handle. Then the cell is decoded+set normally. Patches touching overlapping bytes of the same `(node, kind_id, byte_offset)` are a **build-time and decode-time error** (rejected), so application is order-independent by construction; the canonical patch sort `(node, kind_id, byte_offset)` makes the serialized form byte-unique anyway.
+- **GRAFT — odd-generation sentinel (ai-authoring-first):** the builder seeds every not-yet-resolved `Entity` leaf with `localRef(target) = Entity{ .index = target, .generation = 0xFFFF_FFFF }`. Because `0xFFFF_FFFF` is **odd**, `entity.isLive` (even = alive) treats it as a dead handle. If a patch is ever missed, the residual is a **loud dead handle (fail-closed)** in any system, never a plausible-looking live ref. Belt-and-suspenders for the computed-patch model.
+
+```zig
+pub const LOCAL_REF_GEN: u32 = 0xFFFF_FFFF; // odd => never live (entity.zig isLive)
+pub fn localRef(target: Local) Entity {
+    return .{ .index = @intFromEnum(target), .generation = LOCAL_REF_GEN };
+}
+```
+
+### 15.4 Value storage + reuse decision
+
+Component values are stored as **untyped canonical-LE bytes** (`Cell = image.KindRecord`), not a typed representation — uniform regardless of component count, serializable for free (the bytes *are* the wire form), and it reuses the codec for free. This is the same fork (`F3`, "uniform serializable record") the command buffer already chose.
+
+- **Encode (author time):** `b.add(local, C, v)` runs `serialize.writeValue` into an arena buffer and asserts the encoded length equals `serializedSizeOf(C)`. Type safety is at this front door (`comptime C` + `value: C`), exactly like `CommandBuffer.add`.
+- **Decode + set (instantiate):** reuse the **one** `kind_id → type → readValue → add` dispatch table — but with a *split error policy*. `mutation.applyCommand` stays the trusted path (`readValue(...) catch unreachable`, mutation.zig:83). Untrusted content MUST NOT reach that `unreachable`.
+- **GRAFT — `mutation.applyAdd` slice extraction (ai-authoring-first / Judge #2 #3):** extract the dispatch loop into a slice-based core with an explicit error policy, so content sets a cell from a `[]const u8` **without** the inline `[maxPayload(R)]u8` Command-buffer memcpy round-trip, and the trusted/untrusted split is single-sourced:
+
+```zig
+// in mutation.zig — ONE dispatch table, TWO error policies. `Trust.content` returns error.Corrupt on a
+// bad cell (a corrupt exhaustive-enum tag IS rejected by readValue, serialize.zig:161-165); `Trust.kernel`
+// keeps `catch unreachable` for the command-buffer drain (a kernel-encoded payload cannot fail).
+pub const Trust = enum { kernel, content };
+pub fn applyAdd(comptime R: type, w: *World(R), gpa: Allocator, e: Entity, kind_id: u16,
+                bytes: []const u8, comptime trust: Trust) (if (trust == .content) serialize.Error else error{})!void {
+    inline for (R.Components) |C| if (C.kind_id == kind_id) {
+        var rd = serialize.ByteReader{ .bytes = bytes };
+        const v = switch (trust) {
+            .kernel => serialize.readValue(C, &rd) catch unreachable,
+            .content => try serialize.readValue(C, &rd),
+        };
+        w.add(e, C, v);
+        return;
+    };
+    // unknown kind_id: deterministic no-op (D2), identical to applyCommand
+}
+```
+
+`applyCommand`'s `.add/.set` arm now calls `applyAdd(R, w, gpa, c.entity, c.kind_id, c.payload[0..c.payload_len], .kernel)`. `content.instantiate` calls it with `.content`. The untrusted instantiate path **provably never reaches mutation.zig:83**.
+
+**Reuse decision (matches all three judges' "reuse fidelity" axis):** alias `image.KindRecord` → `Cell` and `image.KindFp` → the fingerprint (no substrate fork; drift-free). **Do not** reuse `image.RowRecord` (it carries a real `Entity` + `u64 mask` — World-image state a template must not have) or the full `Image` (gens/outs/rng/tick). `Node{local, cells}` is the honest, lighter template row.
+
+### 15.5 Deterministic instantiate / loadLevel — why the loaded-World hash is pinnable
+
+```zig
+pub const Error = error{ BadMagic, UnsupportedFormat, SchemaMismatch, Corrupt, BadPatch } || serialize.Error || Allocator.Error;
+
+/// Instantiate one prefab into an EXISTING world; returns the caller-owned local->real map. Spawns nodes
+/// in ascending-local order, applies ref-patches, sets cells via applyAdd(.content). Untrusted-safe.
+pub fn instantiate(comptime R: type, w: *World(R), gpa: Allocator, pf: *const Prefab(R)) Error![]Entity;
+
+/// Build a FRESH World from a Level — the §11 "initial World / proc-gen world / fork-injected content".
+pub fn loadLevel(comptime R: type, gpa: Allocator, lvl: *const Level(R)) Error!World(R);
+```
+
+Deterministic spawn order (the heart of the pin):
+1. `World(R).init(lvl.rng_seed); w.tick = lvl.tick0; w.schema_version = lvl.schema_version`.
+2. Process `placements` in **array order**, then `loose` nodes in **array order**. For each placement, spawn its nodes in **ascending local-id order**. Each `w.spawn(gpa)` calls `entities.alloc` — the FIFO/dense allocator (entity.zig) that, from a fresh `World.init` (empty free queue, never frees during load), hands out `index = generation.items.len` at generation 0 as a **pure function of the spawn count**. So `map[local]` is a deterministic function of `(placement order, per-prefab node count)` alone — no addresses, no hash iteration.
+3. The map is a flat `[]Entity` indexed by dense local id. **Spawn-all-before-patch-and-set** is required so a forward ref (A points at B authored later) resolves: B's handle is already in the map.
+4. Per instance: apply `overrides` (replace named cells), then ref-patches (rewrite local→`map[target]`), then set every cell via `applyAdd(R, w, gpa, map[local], cell.kind_id, patched_bytes, .content)`.
+
+**Pinnability:** the allocator is a pure function of the spawn sequence; cells are canonical-LE bytes; patches write the same canonical `Entity` encoding; component-set goes through the canonical `add`. So the loaded World's `digest()` (XXH64 over `serialize.writeWorld`'s canonical order — already cross-arch-proven by `zig build cross`) is a fixed constant for a given Level. `writeWorld`'s argsort-on-`entity.index` row order makes the hash invariant to physical row order; instantiation never despawns, so rows are already in index order.
+
+### 15.6 Canonical serialization + authoring surface + hostile-hardened decode
+
+Distinct magics so a prefab/level can never be confused with a World image (no `GKZ1` collision surface):
+
+```zig
+pub const PREFAB_MAGIC = [4]u8{ 'G', 'K', 'Z', 'P' };
+pub const LEVEL_MAGIC  = [4]u8{ 'G', 'K', 'Z', 'L' };
+pub const CONTENT_VERSION: u16 = 1;
+
+pub fn writePrefab(comptime R: type, gpa: Allocator, sink: anytype, pf: *const Prefab(R)) !void;
+pub fn readPrefab (comptime R: type, gpa: Allocator, reader: *serialize.ByteReader) Error!Prefab(R);
+pub fn writeLevel (comptime R: type, gpa: Allocator, sink: anytype, lvl: *const Level(R)) !void;
+pub fn readLevel  (comptime R: type, gpa: Allocator, reader: *serialize.ByteReader) Error!Level(R);
+```
+
+Prefab layout (all ints LE via `serialize.putInt`, reusing `ByteSink`):
+```
+PREFAB_MAGIC(4) | version u16 | kind_count u16 (<=64 else Corrupt) | fingerprint[kind_count]{kind_id u16, size u32}
+node_count u32
+  per node (ascending local): local u32 | cell_count u16 | per cell { kind_id u16 } (ascending) ; then cell bytes concatenated (width per fingerprint)
+patch_count u32
+  per patch (ascending (node,kind_id,byte_offset)): node u32 | kind_id u16 | byte_offset u32 | target u32 | path_len u16 | path[path_len] u16
+```
+`writeLevel` = `LEVEL_MAGIC | version | schema_version u32 | tick0 u64 | rng_seed u64 | prefab_count u32 | each writePrefab-body | placement_count u32 | each {prefab_index u32, override_count u32, each {local u32, kind_id u16, cell bytes}} | loose_count u32 | each node-body`. `readLevel` returns an arena-owning Level.
+
+Hostile-hardened decode (modeled exactly on `image.decode`, which reads untrusted bytes):
+- magic mismatch → `BadMagic`; version mismatch → `UnsupportedFormat`.
+- fingerprint validated against `R`: each `kind_id` registered AND `size == serialize.serializedSizeOf(component)` else `SchemaMismatch`; an unregistered kind → `SchemaMismatch`; `kind_count > 64` → `Corrupt` (mask-rank ceiling, no shift overflow).
+- all counts are attacker-controlled → **parse incrementally**, appending to an `ArrayList` only after a full record is read, so a hostile count can never drive a pre-alloc (image.decode lines 119-166). Cell bytes read as `fingerprint[kind].size` via `reader.readSlice` (`Truncated` on short input).
+- a patch whose 8-byte `Entity` write would run past the cell width, or whose `node`/`target`/`kind_id` is out of range, or a duplicate `(node, kind_id, byte_offset)`, or a cell kind appearing twice in one node, or `cell_count > kind_count` → `Corrupt`/`BadPatch` **before any write**.
+- **GRAFT — decode-time legal-offset validator (purist self-assessment + Judge #1/#2):** at `readPrefab`, every patch's resolved `byte_offset` MUST be a member of the comptime-computed **set of legal `Entity`-typed leaf offsets** for that `kind_id` (the reflection-over-`Entity`-fields walk, used purely as a guard, never for rewrite). A persisted prefab whose component fields were reordered (same total width, different layout) becomes `BadPatch`/`SchemaMismatch` instead of a silent wrong-handle write — the one residual hole the loaded-World-hash pin provably cannot catch.
+- **GRAFT — persisted `field_path` (robustness-serialization, open Q #1):** for the **on-disk** format, a patch stores `(kind_id, field_path: []const u16)` and resolves it to `byte_offset` at decode against the **live** registry. This is migration-robust: after a §12 field reorder the path still names the right leaf. The flat `byte_offset` is the **in-memory/runtime-built** form (which cannot go stale); `writePrefab` emits both, `readPrefab` prefers `field_path` when present and cross-checks it against the legal-offset set. This makes the §12 migration story correct rather than silently-miswriting.
+
+**Authoring surface (the §11 thesis — "the AI authors content as data the same way it authors systems as code"):** the **runtime builder is primary** (it must work for proc-gen runtime data, which literals/ZON cannot); a comptime-literal `Prefab(R)` value is also valid. Both are Zig source the compiler checks and git diffs — systems are Zig functions, content is a Zig builder program or literal. **ZON is a declared non-goal for v1** (the builder + canonical bytes already give git-diffable structured data; a ZON front-end is additive convenience on a defined seam, not kernel determinism — it would just drive the same builder).
+
+### 15.7 Proc-gen builder + example
+
+```zig
+pub fn Builder(comptime R: type) type {
+    return struct {
+        const Self = @This();
+        arena: std.heap.ArenaAllocator,
+        nodes: std.ArrayList(Node) = .empty,
+        patches: std.ArrayList(RefPatch) = .empty,
+        pub fn init(gpa: Allocator) Self;
+        pub fn deinit(self: *Self) void; // frees the arena if not yet build()'d
+        pub fn addEntity(self: *Self) Allocator.Error!Local;            // dense local id = nodes.len
+        pub fn add(self: *Self, l: Local, comptime C: type, v: C) Allocator.Error!void; // encodes via the codec
+        pub fn ref(self: *Self, l: Local, comptime C: type, comptime field: []const u8, target: Local) Allocator.Error!void; // comptime byte_offset + field_path of the named Entity field
+        pub fn build(self: *Self) Prefab(R); // sorts cells asc kind_id, patches canonical; transfers arena ownership
+    };
+}
+pub fn LevelBuilder(comptime R: type) type {
+    return struct {
+        pub fn init(gpa: Allocator, seed: u64) @This();
+        pub fn addPrefab(self: *@This(), pf: Prefab(R)) Allocator.Error!u32; // returns prefab_index
+        pub fn place(self: *@This(), prefab_index: u32) Allocator.Error!void;
+        pub fn override(self: *@This(), prefab_index_placement: usize, l: Local, comptime C: type, v: C) Allocator.Error!void;
+        pub fn build(self: *@This()) Level(R);
+    };
+}
+```
+
+Seeded `genLevel` shape — content-code → content-data → deterministic World (RNG is the kernel's counter-based keyed `rng`, integer-only, no host entropy):
+
+```zig
+fn genDungeon(comptime R: type, gpa: Allocator, seed: u64) !Level(R) {
+    var prng = rng.RngRoot{ .seed = seed };
+    var lvl = LevelBuilder(R).init(gpa, seed);
+    const n_rooms: u32 = 4 + @as(u32, @intCast(rng.draw(&prng, .{0}) % 5));
+    var i: u32 = 0;
+    while (i < n_rooms) : (i += 1) {
+        var b = Builder(R).init(gpa);
+        const room = try b.addEntity();
+        const door = try b.addEntity();
+        try b.add(room, Position, .{ .x = Fixed.fromInt(@intCast(rng.draw(&prng, .{i}) % 64)), .y = Fixed.ZERO });
+        try b.add(door, Door, .{ .owner = localRef(room), .locked = (rng.draw(&prng, .{ i, 1 }) & 1) == 1 });
+        try b.ref(door, Door, "owner", room); // door.owner -> the room, resolved at load
+        const pi = try lvl.addPrefab(b.build());
+        try lvl.place(pi);
+    }
+    return lvl.build();
+}
+// genDungeon(gpa, 7) -> a Level VALUE (runtime data); loadLevel instantiates it; its digest is a fixed
+// pin for seed 7. Same seed => byte-identical Level bytes => byte-identical loaded World, across modes+arches.
+```
+
+The builder is used identically for hand-authored literals and generators: the format works for runtime-built data because there is no literal-only path.
+
+### 15.8 Asset-handle contract (headless-first)
+
+An asset handle is a **game-side newtype around a fixed-width int** — not a kernel type. The kernel sees only the integer leaf; it has no asset table, no resolver, no dereference path.
+
+```zig
+// game-side, NOT in the kernel:
+pub const AssetHandle = enum(u64) { none = 0, _ }; // serializes as its u64 tag
+const Sprite = struct { mesh: AssetHandle, tint: u32, pub const kind_id: u16 = 30; };
+```
+
+`enum(u64)` passes `registry.assertSerializable` (its tag is a fixed-width int, not float/pointer), serializes LE via `writeValue`'s `.@"enum"` arm, is cross-arch stable, and is **not** an `Entity` — so the explicit-patch machinery never touches it (no patch names it; with reflection-at-rewrite a u64 handle aliasing `Entity`'s 8-byte shape would be a hazard — here it is structurally impossible). Systems may copy/compare it (`== .none`); the kernel never maps it to memory. That **is** the contract: referenced by handle, not required for the sim to run. Asset **import** (real art → handles) is a §14 seam / §15 non-goal — not built; only the handle-as-data contract is.
+
+### 15.9 Scope boundaries (v1 met / declared seam / §14-§15 non-goal)
+
+**v1 — MET (built, gated):** Prefab + Level types; runtime `Builder` + comptime-literal authoring; canonical `writePrefab/readPrefab/writeLevel/readLevel` with hostile-hardened decode; **world-construction-time** instantiation (`loadLevel` builds a fresh World; `instantiate` places into an existing one — refs resolved immediately); seeded proc-gen producing runtime Level data; asset-handle-as-data + headless run; the full gate set.
+
+**Declared SEAM (genuinely out of §11's remit, named integration point — NOT relabeled-mandated work):** *mid-tick prefab spawning by a system.* §11 requires prefabs be "instantiable many times" and compose initial Worlds — v1 fully meets that at construction time. Mid-tick instantiation is a §4 command-buffer concern: a prefab lowers to a deterministic sequence of `cmdbuf.Command(R)` (spawn × N, then `add` cells, then patch-resolved adds), with local→real resolution deferred to the end-of-tick drain (the map is built as the deferred spawns execute, in `(system_id, seq)` order, then patches applied). v1 does not build the deferred cross-ref fixup because *how a buffer references not-yet-spawned entities* is a command-buffer design question v1 must not pre-judge. The substrate is already shared (cells ARE command payloads), so this is a when-not-what extension.
+
+**§14 SEAM / §15 NON-GOAL (never built):** asset *import* (real art → handles) — §14 "offline, not on a sim path"; §15 "no asset pipelines." Only the handle-as-data contract is in scope. **ZON authoring front-end** — additive convenience over the canonical format; the builder + literals already satisfy "structured, diffable data," so ZON is a non-goal for v1, not deferred-mandated.
+
+### 15.10 Open questions — all resolved
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Override expressiveness (replace vs add/remove a cell) | **Replace-only** in v1 (the minimal diffable primitive; whole-cell replace by `(local, kind_id)`). Add/remove changes the node's mask/cell-set; expressible but widens the format — candidate v1.1, not blocking §11. |
+| 2 | Does `loadLevel` return per-placement local→real maps / named anchors? | `instantiate` **returns** its map; `loadLevel` returns only the World in v1. A named-anchor table (author-assigned name → handle) reintroduces a string/id table into the determinism-critical core — **deferred to a v1.1 design pass**, not built (avoids bloating the pin). |
+| 3 | Nested prefabs (a prefab placement inside a prefab) | **Not in v1.** Levels compose prefabs; prefabs do not nest. Cross-prefab refs would need a level-global local space — a clean recursive extension, flagged, unbuilt. |
+| 4 | Fold prefab/level bytes into the World-image stream | **No.** Keep distinct magics (`GKZP`/`GKZL` vs `GKZ1`); no confusion surface. A future "bake a level into a startable World image" path can hand `Cell`s straight to `image.encode` (the alias buys this for free) without merging formats. |
+| 5 | Persisted patch staleness across a §12 field reorder | **Resolved by the `field_path` graft (§15.6):** persisted patches carry `(kind_id, field_path)` resolved at decode against the live registry; flat `byte_offset` is in-memory-only. |
+| 6 | `field_path` array-element refs (`[4]Entity`) | Supported: a path element indexes an array child by element width; the comptime offset helper recurses structs and indexes arrays (the `ref("links.2", …)` form). |
+
+### 15.11 Determinism-hazards table
+
+| # | Hazard | Eliminating mechanism |
+|---|---|---|
+| 1 | Spawn-order nondeterminism | Spawn ascending dense local-id within each instance; placements then loose nodes in array order. From a fresh `World.init` the FIFO allocator hands out `index = generation.items.len` at gen 0 as a pure function of spawn count. Map is a flat `[]Entity`, never a hashmap — no map-iteration leak. |
+| 2 | Ref-rewrite order | Order-independent by construction: a duplicate `(node, kind_id, byte_offset)` is rejected at build AND decode; each patch overwrites a disjoint 8-byte window over a fully-populated map. Canonical patch sort makes the serialized form unique. |
+| 3 | Float / pointer / usize in values | Impossible: cells are produced only by `serialize.writeValue` (`putInt` → `assertFixedWidth` rejects usize/isize at comptime); `registry.assertSerializable` rejected `.float` (D7) / `.pointer` (D8) at registry construction. AssetHandle is `enum(u64)`, explicit. |
+| 4 | Untrusted-decode panic / OOB | `readPrefab/readLevel` mirror `image.decode`: validate-before-alloc, incremental count-driven parse, fingerprint width/kind checked (`SchemaMismatch`), patch bounds checked before any write (`BadPatch`), `readValue`'s corrupt-enum guard → `Corrupt`. Instantiate uses `applyAdd(.content)` → `error.Corrupt`, **never** reaches `mutation.zig:83`'s `catch unreachable`. |
+| 5 | Cross-arch / endianness | All ints via `serialize.putInt` (explicit LE loop), all values via `writeValue`; no raw struct memory, no usize on the wire. `Local`/offsets/ids are explicit `enum(u32)`/`u16`/`u32`. Loaded-World hash rides `serialize.writeWorld` — the cross gate already proves it. |
+| 6 | Instance cross-contamination | Each `instantiate` call gets its own local→real map; patches resolve only within that map. Two instances of one prefab yield disjoint, internally-consistent entity sets (multi-instance ref-isolation gate). |
+| 7 | Silent same-width field-reorder miswrite | **Decode-time legal-`Entity`-leaf-offset validator** (graft) → `BadPatch`; persisted `field_path` resolves against the live registry; **comptime Gate #8** (next row) makes the authored-type case a compile failure. The one hazard the hash pin cannot catch, now closed three ways. |
+| 8 | Offset-helper vs codec drift | **GRAFT — comptime Gate #8 (reuse-minimal, Judge #1/#2/#3 unanimous):** a comptime assert per component that the ref offset-helper's `byte_offset` for field F equals the position `serialize.writeValue` emits F at. Implemented as **one offset authority** — the helper calls the same recursion `serializedSizeOf` uses, so there is a single traversal, not two that must stay in lockstep. Converts the silent wrong-handle bug into a build failure. |
+| 9 | Allocator high-water on `instantiate` into a populated world | `loadLevel` starts from `World.init` (empty free queue), so spawns are pure extension, never recycle. `instantiate` into a populated world continues from its high-water mark deterministically; the returned map captures the actual handles, so the caller never assumes `index == local`. |
+| 10 | Missed/unresolved ref | `localRef` sentinel generation `0xFFFF_FFFF` is odd → `isLive` false → a loud dead handle (fail-closed), never a plausible live ref (graft). |
+
+### 15.12 Gate test list (folded into `zig build test` 3-mode + `zig build cross` 4-arch)
+
+All gates live in `content.zig` tests (Debug/ReleaseSafe/ReleaseFast) plus pins added to the root suite the cross matrix re-runs under qemu (aarch64/s390x/arm/mips), mirroring `migrate/gate.zig` and `step_par_gate.zig`. Pin-bearing runs set `has_side_effects = true`.
+
+1. **Pinned loaded-World hash.** A fixed reference `Level` (instances + refs + an `AssetHandle`) → `loadLevel` → `world.digest().hash == 0x<CONST>` and `.crc == 0x<CONST>`. THE determinism pin; re-checked unchanged under all 3 modes and all 4 arches (the s390x/mips big-endian runs are the decisive witnesses).
+2. **Round-trip byte-identity.** `writePrefab(pf) → bytes A → readPrefab → writePrefab → bytes B`; `expectEqualSlices(A, B)`. Same for level. Plus `loadLevel(readLevel(writeLevel(lvl))).digest == loadLevel(lvl).digest`. Proves canonical ordering is a fixed point.
+3. **Multi-instance ref isolation.** Instantiate the same 2-node prefab (A refs B) twice into one World; assert the two A-handles differ, the two B-handles differ, `inst0.A.ref == inst0.B`, `inst1.A.ref == inst1.B`, `inst0.A.ref != inst1.B`. The semantic test that catches a wrong-handle resolution.
+4. **Proc-gen determinism.** `genDungeon(7)` twice → byte-identical Level bytes AND equal loaded digests; `genDungeon(7).digest == pinned const` (cross-mode + cross-arch); `genDungeon(7) != genDungeon(8)` (seed drives content).
+5. **Asset-handle headless run.** Load a Level carrying `Sprite{mesh}` with NO asset table; `runScheduled` N ticks; assert it completes and the per-tick hash stream == a pinned sequence. Companion: changing only `mesh` changes the hash (it is hashed state) but not the structural step outcome when no system reads it. The headless-first thesis as an executable gate.
+6. **Hostile decode battery (never panics).** truncated → `Truncated`; bad magic → `BadMagic`; bad version → `UnsupportedFormat`; width-mismatched fingerprint → `SchemaMismatch`; `kind_count = 65` → `Corrupt`; patch offset past cell end → `BadPatch`; out-of-range `target`/`node` → `BadPatch`; duplicate `(node,kind,offset)` → `Corrupt`; corrupt enum tag in a cell → `Corrupt`; a patch offset not in the legal-`Entity`-leaf set → `BadPatch`. Each `expectError`; wire into the §9 VOPR corpus as a decode-fuzz target.
+7. **GRAFT — OOM-injection sweep (robustness-serialization).** `std.testing.FailingAllocator` over `decode → validate → instantiate`, asserting leak/double-free freedom of the arena `errdefer` path (the arena-owning `readPrefab/readLevel/Builder.build` partial-construction hazard the other gates do not exercise).
+8. **Comptime Gate #8.** A comptime/test assert per component that the ref offset-helper agrees with `writeValue`'s emit position for each `Entity` field (single offset authority).
+9. **Cross-build + cross-arch.** Pins 1/4/5 + Gate #8 added to the root test module `zig build cross` re-runs on {aarch64, s390x, arm, mips} = the {32,64}×{LE,BE} matrix. A divergent constant on any arch/mode fails loudly.
+
+### 15.13 Ordered implementation checklist
+
+1. **`mutation.zig`:** extract `applyAdd(R, w, gpa, e, kind_id, bytes, comptime trust)` from the `applyCommand` `.add/.set` arm; route `applyCommand` through it with `.kernel`. Re-run the mutation tests (must stay green — pure refactor).
+2. **`src/content.zig`:** `Local`, `Cell` (alias `image.KindRecord`), `Node`, `RefPatch`, `Prefab(R)`, `Level(R)`, `Placement`, `Override`, `localRef`, `LOCAL_REF_GEN`, magics, `CONTENT_VERSION`, `Error`.
+3. Comptime offset authority: `entityLeafOffsets(comptime C) []const u32` (the legal-`Entity`-leaf set) and `fieldOffset(comptime C, comptime path)` — **both** calling the same `serializedSizeOf` recursion. Gate #8 (comptime assert) sits here.
+4. `Builder(R)` / `LevelBuilder(R)`: `addEntity/add/ref/build` (encode via codec, seed `localRef` sentinels, emit canonical patches + `field_path`).
+5. `instantiate` + `loadLevel`: spawn-all → overrides → patch → `applyAdd(.content)`; return the flat map.
+6. `writePrefab/readPrefab/writeLevel/readLevel`: canonical write (nodes asc local, patches asc `(node,kind,offset)`); hostile-hardened decode with the legal-offset validator + `field_path` resolution.
+7. `AssetHandle`/`Sprite` + `genDungeon` example in the test module.
+8. Gates 1–8 in `content.zig`; register `content` in `root.zig`.
+9. **Recompute pins** (a guarded `dumpPin` run outside `--listen`), freeze the constants into gates 1/4/5.
+10. Add pins 1/4/5 + Gate #8 to the root suite; run `zig build test` (3 modes) then `zig build cross` (4 arches) — all green.
+
+### 15.14 Residual risks
+
+- **Anchor addressability (open Q #2).** v1 has no named-anchor table, so a caller wanting "the player" after `loadLevel` must derive it from placement/local arithmetic or use `instantiate` directly and keep the returned map. A v1.1 anchor table is the most likely first feature request; kept out of v1 to protect the pin from a string/id table.
+- **Persisted-prefab migration.** The `field_path` form makes a reordered-field reload correct, but a §12 op that *renames* or *retypes* a field (not just reorders) still needs the migration chain; v1 does not run `readPrefab → migrate.apply → instantiate`. Wiring that composition (clean — `Cell` is `image.KindRecord`) is a v1.1 decision, flagged.
+- **Mid-tick spawning is a seam, not built.** Construction-time §11 is complete; the deferred-resolution semantics interact with the §4 drain order and are out of §11's remit. If a future system needs runtime prefab spawning, the `cmdbuf` lowering is specified above but unproven.
+- **Override granularity.** Whole-cell replace only; a field-level override (reusing the patch machinery for value-not-handle edits) is unbuilt — sufficient for the AI-authoring use case in v1, revisit if proc-gen wants finer diffs.
+- **u32 local-id / u16 cell-count caps.** A single prefab is bounded at 4B nodes / 65535 cells per node — far beyond hand-authored or reasonable proc-gen prefabs; a generated mega-world splits into placements (the Level composition handles it). The split point is an ergonomics convention, not enforced.
+
+### 15.15 Phase 10 notes (from the adversarial review — 11 confirmed / 0 refuted; the 2 HIGH + 4 MEDIUM + substantive LOWs fixed; the AS-BUILT record)
+
+This subsection is authoritative where it differs from §15.1–§15.14 (which is the panel's design intent verbatim).
+
+1. **HIGH — `field_path` was never built; demoted to a declared v1.1 non-goal (hard-rule reconciliation).** §15.2/§15.6/§15.10-Q5/Q6/§15.11-#7/§15.13 describe a persisted `field_path` (+ a `Builder.ref(field-path)` method and a `fieldOffset` helper) as built. The code has none: `RefPatch` is `{node, kind_id, byte_offset, target}`, and the builder derives patches by walking a value's `Entity` leaves for the `localRef` **sentinel** (gen `0xFFFFFFFF`). This is honest to satisfy: **SPEC §11 (a)(b)(c) do NOT require `field_path`** — it is a §12-*prefab-migration* robustness graft, and prefab migration is itself a v1.1 item (§15.14 residual #2). The fail-closed safety §15.6/§15.11-#7 attribute partly to `field_path` is delivered in full by the **decode-time legal-offset validator** (`legalEntityOffset`, built) + **comptime Gate #8** (built): a reordered-field persisted prefab is rejected as `BadPatch` (safe), it is simply not auto-repaired. v1.1 may add `field_path` when prefab↔migration composition lands.
+2. **HIGH — Builder re-set left stale ref-patches (real bug, fixed).** `insertCell` replaces a re-set cell, but `add` only appended patches and `build` only sorted — so re-setting a component left the prior set's patches, which would clobber the new value (or duplicate a `(node,kind,offset)` that `readPrefab` rejects as `Corrupt`). Fixed: `add` now retain-filters `self.patches`, dropping any `(node==l, kind_id==C.kind_id)` before emitting the current set's patches. Test: "re-setting a component replaces its cell AND drops the stale ref-patch".
+3. **MEDIUM — override-vs-ref semantics decided + enforced.** An `Override` now supplies LITERAL final bytes: `instantiate` applies an overridden cell verbatim and SKIPS the ref-patch rewrite for it (an override fully replaces the cell, including any managed ref). Documented; test: "an override is literal — its managed ref is NOT resolved".
+4. **MEDIUM — the loose-node path is now reachable + witnessed.** Added `LevelBuilder.addLoose(prefab)` (copies a no-patch prefab's nodes as standalone loose entities; dense local ids). A content.zig test round-trips a level with loose nodes through `writeLevel`/`readLevel` and instantiates it (so the loose write/decode/instantiate path runs in the 3-mode AND cross-arch matrix); the false "+ one loose entity" comment in content_gate was corrected.
+5. **MEDIUM — hostile-decode battery expanded.** Added `expectError` cases beyond bad-magic/truncation: corrupt version → `UnsupportedFormat`; corrupt fingerprint width → `SchemaMismatch`; illegal patch `byte_offset` (not an `Entity` leaf) → `BadPatch`; out-of-range `target` → `BadPatch`; duplicate `(node,kind,offset)` → `Corrupt` (via literal Prefabs whose write does not validate).
+6. **LOW (fixed):** content sorts now route through the pinned `sort.zig` wrapper (not `std.mem.sort`); `instantiate` re-validates each patch offset via `legalEntityOffset` (so a hand-built — not just decoded — Prefab cannot silently miswrite); the `Level` single-arena invariant (contained prefabs have `arena=null`) is documented on `Level.deinit`; Gate #8 extended to a multi-`Entity` struct + a `[N]Entity` array, plus a "two distinct local refs resolve to distinct correct handles" instantiate test (witnesses the offset-12 / array-element arithmetic — the exact silent-wrong-handle case the design flags).
+7. **As-built builder API:** `Builder{addEntity, add, build}` (no `ref()` — the sentinel-walk derives patches); `LevelBuilder{init, addPrefab, place, addLoose, build}`. Overrides are supported as `Placement.overrides` DATA + `instantiate` (tested); a `LevelBuilder.placeWith(overrides)` convenience is a trivial follow-on, not built.
+8. **LOW acknowledged, not changed:** the C6 OOM sweep is arena-granular (the arena amortizes decode/instantiate allocations), so it fingerprints arena-ownership leak-freedom rather than per-logical-allocation; arena ownership is the model, so this is sufficient.
+
+Gate target as-built: **+13 content gate tests** folded into the base suite (6→ the content.zig unit/round-trip/ref/hostile/loose battery; the C1–C6 pinned cross-build + cross-arch witnesses in content_gate.zig). Pins `PIN_REF_LEVEL`/`PIN_REF_CRC`/`PIN_GEN7`/`PIN_HEADLESS_STREAM` hold across Debug/ReleaseSafe/ReleaseFast and all four cross arches.

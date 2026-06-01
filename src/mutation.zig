@@ -54,6 +54,39 @@ pub fn commandToMutation(comptime Reg: type, c: Command) ?Mutation(Reg) {
     };
 }
 
+/// Trust policy for `applyAdd`. `.kernel` = the bytes were just encoded by this codec (the
+/// command-buffer drain), so a decode failure is a kernel bug → `catch unreachable` (a loud panic, never
+/// a silent divergence). `.content` = the bytes come from UNTRUSTED content (a §11 prefab/level decoded
+/// from anywhere), so a decode failure is `error.Corrupt`, never a panic.
+pub const Trust = enum { kernel, content };
+
+/// Set a typed component on an existing entity from `(kind_id, canonical-LE value bytes)` — the ONE
+/// kind_id→type dispatch, shared by the command-buffer drain (`.kernel`, below) and §11 content
+/// instantiation (`.content`, content.zig). An unknown `kind_id` is a deterministic no-op (D2). `w.add`
+/// is non-allocating (the entity's row already exists), so this never allocates. The `.content` path
+/// surfaces a corrupt cell as `error.Corrupt` and so provably never reaches the `.kernel` `unreachable`.
+pub fn applyAdd(
+    comptime R: type,
+    w: *worldmod.World(R),
+    e: Entity,
+    kind_id: u16,
+    bytes: []const u8,
+    comptime trust: Trust,
+) (if (trust == .content) serialize.Error else error{})!void {
+    inline for (R.Components) |C| {
+        if (C.kind_id == kind_id) {
+            var rd = serialize.ByteReader{ .bytes = bytes };
+            const v = switch (trust) {
+                .kernel => serialize.readValue(C, &rd) catch unreachable, // kernel-encoded, cannot fail
+                .content => try serialize.readValue(C, &rd),
+            };
+            w.add(e, C, v);
+            return;
+        }
+    }
+    // unknown kind_id: deterministic no-op (D2)
+}
+
 /// Apply one system-emitted `command_buffer.Command(R)` to the World (the end-of-tick drain path,
 /// SPEC §4). Total: a `.noop`/unknown op, an unknown `kind_id`, or a stale entity is a deterministic
 /// no-op (D2). `.add` and `.set` are equivalent in Phase 1 (both ensure the component is present with
@@ -76,17 +109,7 @@ pub fn applyCommand(
         .noop => {},
         .spawn => _ = try w.spawn(gpa),
         .despawn => try w.despawn(gpa, c.entity),
-        .add, .set => {
-            inline for (R.Components) |C| {
-                if (C.kind_id == c.kind_id) {
-                    var rd = serialize.ByteReader{ .bytes = c.payload[0..c.payload_len] };
-                    const v = serialize.readValue(C, &rd) catch unreachable; // kernel-encoded, cannot fail
-                    w.add(c.entity, C, v);
-                    return;
-                }
-            }
-            // unknown kind_id: deterministic no-op
-        },
+        .add, .set => try applyAdd(R, w, c.entity, c.kind_id, c.payload[0..c.payload_len], .kernel),
         .remove => {
             inline for (R.Components) |C| {
                 if (C.kind_id == c.kind_id) {
