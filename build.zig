@@ -118,8 +118,18 @@ pub fn build(b: *std.Build) void {
                 .optimize = mode,
                 .imports = &.{.{ .name = "gkz", .module = gkz_worker_mod }},
             }) });
+            // §17: a second per-mode daemon EXE — the TCP network worker the proc gate spawns to prove the
+            // networkExecutor transport across a REAL process boundary (the multi-machine seam, now closed).
+            const net_worker = b.addExecutable(.{ .name = b.fmt("gkz_net_worker_{s}", .{@tagName(mode)}), .root_module = b.createModule(.{
+                .root_source_file = b.path("src/proc/net_worker_main.zig"),
+                .target = target,
+                .optimize = mode,
+                .imports = &.{.{ .name = "gkz", .module = gkz_worker_mod }},
+            }) });
+
             const proc_opts = b.addOptions();
             proc_opts.addOptionPath("worker_exe_path", worker.getEmittedBin()); // injects path + build-graph dep
+            proc_opts.addOptionPath("net_worker_exe_path", net_worker.getEmittedBin()); // §17 TCP daemon path + dep
 
             const gkz_pgate_mod = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = mode });
             gkz_pgate_mod.addImport("fpz", fpz_mode.module("fpz"));

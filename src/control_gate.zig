@@ -55,7 +55,22 @@ const m_1_2 = migrate.Migration{
 };
 const chain_1_2 = migrate.Chain{ .migrations = &.{m_1_2} };
 
-// --- systems: two same-R sets for V1 (the reload swap), one for V2 ---------------------------------
+const Extra = struct {
+    v: u8,
+    pub const kind_id: u16 = 4;
+};
+const RV3 = registry.Registry(.{ Pos, Vel, Tag, Extra });
+const WV3 = worldmod.World(RV3);
+/// v2→v3: add Extra (default v=0). Drives the 3-phase runSession generality witness (K7).
+const m_2_3 = migrate.Migration{
+    .from_version = 2,
+    .to_version = 3,
+    .ops = &.{.{ .add_kind = .{ .kind_id = 4, .default_bytes = &.{0} } }},
+    .target_fingerprint = migrate.currentFingerprint(RV3),
+};
+const chain_2_3 = migrate.Chain{ .migrations = &.{m_2_3} };
+
+// --- systems: two same-R sets for V1 (the reload swap), one each for V2/V3 -------------------------
 
 fn moveV1(ctx: *SimCtx(RV1), q: *Query(RV1, .{ Read(Vel), Write(Pos) })) std.mem.Allocator.Error!void {
     _ = ctx;
@@ -85,10 +100,23 @@ const set0_v1 = [_]Sys(RV1){schedule.system(RV1, "move", moveV1)}; // plain move
 const set1_v1 = [_]Sys(RV1){ schedule.system(RV1, "move", moveV1), schedule.system(RV1, "jitter", jitterV1) }; // move + jitter (diverges)
 const set0_v2 = [_]Sys(RV2){schedule.system(RV2, "move", moveV2)};
 
+fn moveV3(ctx: *SimCtx(RV3), q: *Query(RV3, .{ Read(Vel), Write(Pos) })) std.mem.Allocator.Error!void {
+    _ = ctx;
+    while (q.next()) |r| {
+        const v = r.read(Vel).*;
+        const p = r.write(Pos);
+        p.x += v.dx;
+        p.y += v.dy;
+    }
+}
+const set0_v3 = [_]Sys(RV3){schedule.system(RV3, "move", moveV3)};
+
 const srcs_v1 = [_]reload.SystemSource(RV1){ reload.inProcessSource(RV1, &set0_v1), reload.inProcessSource(RV1, &set1_v1) };
 const srcs_v2 = [_]reload.SystemSource(RV2){reload.inProcessSource(RV2, &set0_v2)};
+const srcs_v3 = [_]reload.SystemSource(RV3){reload.inProcessSource(RV3, &set0_v3)};
 const setsV1 = control.SetTable(RV1){ .sources = &srcs_v1 };
 const setsV2 = control.SetTable(RV2){ .sources = &srcs_v2 };
+const setsV3 = control.SetTable(RV3){ .sources = &srcs_v3 };
 
 const T1: u64 = 3; // reload here
 const T2: u64 = 6; // migrate here
@@ -112,67 +140,21 @@ const FROZEN = [_]control.ControlEvent{
     .{ .at_tick = T2, .op = .{ .migrate = 0 } },
 };
 
-// --- sessions: a concrete V1→V2 phase walk (replay and live capture) --------------------------------
+// --- the multi-phase session: driven by the GENERIC control.runSession (no longer hand-rolled) ------
 
-/// REPLAY a V1→V2 session from a frozen schedule; returns the final V2 World digest. Folds the per-tick
-/// stream if `stream != null`.
+const phases2 = .{ control.Phase(RV1){ .sets = setsV1 }, control.Phase(RV2){ .sets = setsV2 } };
+const edges2 = .{control.MigrateEdge(RV1, RV2){ .chain = chain_1_2 }};
+const phases3 = .{ control.Phase(RV1){ .sets = setsV1 }, control.Phase(RV2){ .sets = setsV2 }, control.Phase(RV3){ .sets = setsV3 } };
+const edges3 = .{ control.MigrateEdge(RV1, RV2){ .chain = chain_1_2 }, control.MigrateEdge(RV2, RV3){ .chain = chain_2_3 } };
+
+/// REPLAY the V1→V2 session from a frozen schedule via the GENERIC `runAllPhases` (was a hand-rolled walk;
+/// the pins below are UNCHANGED, proving the generic driver computes the identical bytes).
 fn replaySession(gpa: std.mem.Allocator, sched: control.ControlSchedule, stream: ?*std.hash.XxHash64) !u64 {
-    const w1 = try seedV1(gpa);
-    const oc1 = try control.runWithControl(RV1, gpa, w1, &no_inputs, 0, sched, 0, setsV1, 0, TOTAL, stream, null);
-    switch (oc1) {
-        .completed => |w| {
-            var ww = w;
-            defer ww.deinit(gpa);
-            return (try ww.digest(gpa)).hash; // (no migrate scheduled — not our case, but total)
-        },
-        .migrate => |m| {
-            defer {
-                var s = m.pre;
-                s.deinit(gpa);
-            }
-            std.debug.assert(m.migration_id == 0);
-            std.debug.assert(m.at_tick == T2);
-            const w2 = try migrate.migrateWorld(RV2, gpa, chain_1_2, m.pre.bytes);
-            const oc2 = try control.runWithControl(RV2, gpa, w2, &no_inputs, m.next_inputs_from, sched, m.resume_from, setsV2, 0, TOTAL, stream, null);
-            switch (oc2) {
-                .completed => |w| {
-                    var ww = w;
-                    defer ww.deinit(gpa);
-                    return (try ww.digest(gpa)).hash;
-                },
-                .migrate => unreachable, // only one migrate in this schedule
-            }
-        },
-    }
+    return control.runAllPhases(phases2, edges2, gpa, seedV1, &no_inputs, sched, TOTAL, stream, null);
 }
-
-/// LIVE-CAPTURE a V1→V2 session driven by exogenous triggers; appends the captured schedule into `out`.
+/// LIVE-CAPTURE the V1→V2 session via the GENERIC `captureAllPhases`; appends the captured schedule to `out`.
 fn captureSession(gpa: std.mem.Allocator, tV1: control.Trigger(RV1), tV2: control.Trigger(RV2), out: *std.ArrayList(control.ControlEvent), stream: ?*std.hash.XxHash64) !u64 {
-    const w1 = try seedV1(gpa);
-    const oc1 = try control.captureWithControl(RV1, gpa, w1, &no_inputs, 0, tV1, setsV1, 0, TOTAL, out, gpa, stream, null);
-    switch (oc1) {
-        .completed => |w| {
-            var ww = w;
-            defer ww.deinit(gpa);
-            return (try ww.digest(gpa)).hash;
-        },
-        .migrate => |m| {
-            defer {
-                var s = m.pre;
-                s.deinit(gpa);
-            }
-            const w2 = try migrate.migrateWorld(RV2, gpa, chain_1_2, m.pre.bytes);
-            const oc2 = try control.captureWithControl(RV2, gpa, w2, &no_inputs, m.next_inputs_from, tV2, setsV2, 0, TOTAL, out, gpa, stream, null);
-            switch (oc2) {
-                .completed => |w| {
-                    var ww = w;
-                    defer ww.deinit(gpa);
-                    return (try ww.digest(gpa)).hash;
-                },
-                .migrate => unreachable,
-            }
-        },
-    }
+    return control.captureAllPhases(phases2, edges2, gpa, seedV1, &no_inputs, .{ tV1, tV2 }, TOTAL, out, gpa, stream, null);
 }
 
 // --- triggers ---------------------------------------------------------------------------------------
@@ -331,6 +313,29 @@ test "K6: a past-due (unreachable) scheduled event is caught loudly, not silentl
     const bad = [_]control.ControlEvent{.{ .at_tick = 0, .op = .{ .reload = 1 } }};
     const w1 = try seedV1(gpa);
     try testing.expectError(error.NonMonotonicSchedule, control.runWithControl(RV1, gpa, w1, &no_inputs, 0, .{ .events = &bad }, 0, setsV1, 0, TOTAL, null, null));
+}
+
+test "K7: runSession generalizes past N=2 — a 3-phase V1->V2->V3 session + loud under/over/mis-migrated errors" {
+    const gpa = testing.allocator;
+    const T3: u64 = 8; // migrate V2->V3 here (< TOTAL)
+    const sched3 = [_]control.ControlEvent{
+        .{ .at_tick = T1, .op = .{ .reload = 1 } },
+        .{ .at_tick = T2, .op = .{ .migrate = 0 } }, // V1 -> V2 (departing phase 0)
+        .{ .at_tick = T3, .op = .{ .migrate = 1 } }, // V2 -> V3 (departing phase 1)
+    };
+    // a real 3-phase walk the hand-rolled 2-phase helper could not express; deterministic.
+    const a = try control.runAllPhases(phases3, edges3, gpa, seedV1, &no_inputs, .{ .events = &sched3 }, TOTAL, null, null);
+    const b = try control.runAllPhases(phases3, edges3, gpa, seedV1, &no_inputs, .{ .events = &sched3 }, TOTAL, null, null);
+    try testing.expectEqual(a, b);
+
+    // UNDER-migrated: phases3 but the schedule stops at migrate(0) → V2 completes early → loud.
+    const under = [_]control.ControlEvent{.{ .at_tick = T2, .op = .{ .migrate = 0 } }};
+    try testing.expectError(error.UnexpectedCompletion, control.runAllPhases(phases3, edges3, gpa, seedV1, &no_inputs, .{ .events = &under }, TOTAL, null, null));
+    // OVER-migrated: phases2 but the schedule migrates twice → migrate off the terminal phase.
+    try testing.expectError(error.TooManyMigrations, control.runAllPhases(phases2, edges2, gpa, seedV1, &no_inputs, .{ .events = &sched3 }, TOTAL, null, null));
+    // MIS-routed: a migrate id that is not the departing phase index.
+    const mis = [_]control.ControlEvent{.{ .at_tick = T2, .op = .{ .migrate = 5 } }};
+    try testing.expectError(error.BadMigrationId, control.runAllPhases(phases3, edges3, gpa, seedV1, &no_inputs, .{ .events = &mis }, TOTAL, null, null));
 }
 
 test "dumpPin compiles" {

@@ -138,6 +138,14 @@ pub const Executor = proc.Executor;
 pub const Supervisor = proc.Supervisor;
 pub const QueryServer = proc.QueryServer;
 pub const runWorker = proc.runWorker;
+// §17 control-plane completion: the live mutate-a-sim command surface (the WRITE half of the control
+// plane — QueryServer is the read half) + the across-machines TCP execution transport. See PLAN §17.
+pub const ControlServer = proc.ControlServer;
+pub const ControlCommand = proc.ControlCommand;
+pub const ControlResponse = proc.ControlResponse;
+pub const networkExecutor = proc.networkExecutor;
+pub const NetCtx = proc.NetCtx;
+pub const runNetWorker = proc.runNetWorker;
 
 pub const reload = @import("reload.zig");
 pub const SystemSet = reload.SystemSet;
@@ -184,6 +192,16 @@ pub const runWithControl = control.runWithControl;
 pub const captureWithControl = control.captureWithControl;
 pub const writeSchedule = control.writeSchedule;
 pub const readSchedule = control.readSchedule;
+// §17: the generic multi-phase SESSION driver — drives reload + migrate across R-retyping boundaries
+// (a flat loop can't, since the World type changes per phase). runSession recurses into the next R's
+// monomorphization on each migrate; runAllPhases seeds phase 0 and drives to the final digest.
+pub const Phase = control.Phase;
+pub const MigrateEdge = control.MigrateEdge;
+pub const runSession = control.runSession;
+pub const runAllPhases = control.runAllPhases;
+pub const captureSession = control.captureSession;
+pub const captureAllPhases = control.captureAllPhases;
+pub const applyReload = control.applyReload;
 
 /// Bring-up placeholder so the scaffold `main.zig` keeps compiling during Phase 1. Replaced by a real
 /// kernel demo once `step`/`snapshot`/`replay` land.

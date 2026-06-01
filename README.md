@@ -238,7 +238,10 @@ author), but it **detects** a bad reload.
 | `executor.zig` | The `Executor` transport seam: `inProcessExecutor` (determinism floor) + `subprocessExecutor` (a real `std.process.run` child, temp-file job, timeout-bounded, crash/hang/spawn-fail harvested) |
 | `worker.zig` · `worker_main.zig` | The one-shot worker (`gkz worker <job>`): read a job, run it against a comptime-fixed registry, write the result frame to stdout |
 | `supervisor.zig` | The process pool: shard a sweep, dispatch index-addressed, restart-on-crash (the job is the repro), merge survivors in canonical shard-index order |
-| `qserver.zig` | The query server: `respond()` (unchanged) multiplexed across live sims by `sim_id`, served over a real `std.Io.net` Unix-domain socket (`serveUnix`) |
+| `qserver.zig` | The query server (the **read** half of the control plane): `respond()` (unchanged) multiplexed across live sims by `sim_id`, served over a real `std.Io.net` Unix-domain socket (`serveUnix`) |
+| `control_wire.zig` | The AI control-command codec (`GKZC2` commands / `GKZD1` responses): `hello`/`query`/`step`/`reload`/`fork`/`snapshot`/`migrate` + typed `ControlErr`; hostile-input hardened like `job.zig` (incremental Input decode, trailing-garbage → `Corrupt`) |
+| `control_server.zig` | The **write** half of the control plane: `ControlServer(R, systems)` owns mutable live sims and **drives** them — step/reload/fork/snapshot/migrate — through the SAME `stepDynamic`/`applyReload`/`snapshot` primitives as the replay driver, so a live-driven session is byte-identical to its replay. `serveSession` = a persistent multi-command connection |
+| `net_executor.zig` · `net_worker.zig` · `net_worker_main.zig` | The **across-machines** transport: `networkExecutor` is a third `Executor` impl shipping the same `GKZJ1`/`GKZK1` frames over TCP to a `gkz_net_worker` daemon running the SHARED `runJobBytes` |
 
 A sim runs as **one OS process** (crash-isolation: a defect can't take the node down, *and* a crash is a
 repro, §9). A `Supervisor` shards a seed sweep across worker processes via an `Executor` and dispatches them
@@ -253,10 +256,13 @@ gate proves it: a real subprocess's per-tick result bytes **equal the in-process
 digest in all three modes**, a sharded sweep run concurrently across real worker processes equals the
 sequential one, a deliberately crashing worker is harvested as a `Term.signal` repro (which a disguised
 in-process run structurally cannot fake), a hung worker is killed by the timeout, and the socket reply equals
-`respond()` byte-for-byte. The one genuine frontier — distributing workers to **other machines** (a
-`NetworkExecutor` over the same job/result frames + transport) — needs a second host to gate and is reachable
-through the same `Executor` seam; the reload/migrate *trigger* and auth/TLS are the remaining control-plane
-refinements.
+`respond()` byte-for-byte. The control plane is now complete on **both** halves: beyond the read-only query
+server, a **`ControlServer` drives live sims** (step/reload/fork/snapshot/migrate) over a persistent command
+socket, and a **`networkExecutor` distributes work across machines** — the gate proves a live socket-driven
+session is **bit-identical to its deterministic replay**, and that a job computed in a **genuinely separate
+OS process** carried over TCP equals the in-process bytes and the pinned cross-mode digest (localhost is only
+the test substrate; nothing in the path assumes a co-located peer). The remaining refinements are now
+narrow: auth/TLS, and a physical second host as a *stronger* (not *missing*) network witness (see PLAN §17).
 
 ### Phase 10 — Content as data (SPEC §11)
 
@@ -297,8 +303,12 @@ re-typing boundary (`R_old→R_new`) — the driver snapshots to canonical bytes
 `migrateWorld`s and resumes. The gate witnesses it: a reload+migrate captured live then replayed from the
 schedule is bit-identical and cross-arch-pinned; a tamper trigger that would diverge if re-invoked is
 never called on replay (its counter stays put); a clock-reading decider influences only *which* ops are
-captured, never replay. (The generic multi-phase `runSession` helper, a socket-driven live trigger, and
-multi-machine are declared v1.1/seams — see PLAN §16.15.)
+captured, never replay. The control plane is now **completed end-to-end** (PLAN §17): the generic
+multi-phase **`runSession`** drives reload+migrate across `R`-retyping boundaries (recursing into each
+phase's monomorphization), the **`ControlServer`** is the socket-driven live trigger (an AI drives a sim
+over a `GKZC2`/`GKZD1` command connection), and the **`networkExecutor`** distributes work across machines
+— each gated, including a **live-session == deterministic-replay** witness and a **separate-process TCP**
+witness.
 
 ### Determinism contract (the spine)
 
@@ -327,7 +337,8 @@ contract:
 - **Phase 10** — Content as data (§11): `Prefab`/`Level` as diffable records, deterministic instantiation (a pinned loaded-World digest, cross-arch), seeded proc-gen, asset-handles-as-data (headless-first) ✅
 - **Cross-architecture determinism gate** (`zig build cross`): every pin re-checked under qemu on aarch64/s390x/arm/mips — the {32,64}-bit × {LE,BE} matrix ✅
 - **Reload/migrate control trigger** (§12↔§13, `control.zig`): a captured, replayable `ControlSchedule`; reload+migrate driven reproducibly at tick boundaries; the exogenous trigger captured live and never re-invoked on replay (cross-arch pinned) ✅
-- **Next** — distributing workers to **other machines** (a `NetworkExecutor` over the same job/result frames; needs a second host to gate); plus the remaining control-plane integration on the seams built here: a **socket/watch-driven** live `Trigger`, the generic multi-phase `runSession`, and socket auth
+- **Control-plane completion** (§13/§17): the generic multi-phase **`runSession`** (reload+migrate across `R`-retyping phases); the live **`ControlServer`** write surface (step/reload/fork/snapshot/migrate over a `GKZC2`/`GKZD1` command socket) with a **driven-session == deterministic-replay** gate; the across-machines **`networkExecutor`** (TCP) gated over a real socket *and* a genuinely separate OS process ✅
+- **Next** — control-plane **auth/TLS**, a **physical second host** as a stronger (not missing) network witness, and persistent-connection refinements (see PLAN §17.14)
 
 See [`PLAN.md`](./PLAN.md) §6 for the full phase map.
 

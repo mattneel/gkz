@@ -32,10 +32,27 @@ pub const Supervisor = supervisor.Supervisor;
 pub const qserver = @import("proc/qserver.zig");
 pub const QueryServer = qserver.QueryServer;
 
+// §17 control-plane completion: the live control-command surface + the across-machines network transport.
+pub const control_wire = @import("proc/control_wire.zig");
+pub const ControlCommand = control_wire.ControlCommand;
+pub const ControlResponse = control_wire.ControlResponse;
+pub const control_server = @import("proc/control_server.zig");
+pub const ControlServer = control_server.ControlServer;
+pub const net_executor = @import("proc/net_executor.zig");
+pub const networkExecutor = net_executor.networkExecutor;
+pub const NetCtx = net_executor.NetCtx;
+const net_worker_mod = @import("proc/net_worker.zig");
+pub const runNetWorker = net_worker_mod.runNetWorker;
+pub const listenLoopback = net_worker_mod.listenLoopback;
+
 test {
     _ = job;
     _ = executor;
     _ = worker_mod;
     _ = supervisor;
     _ = qserver;
+    _ = control_wire;
+    _ = control_server;
+    _ = net_executor;
+    _ = net_worker_mod;
 }

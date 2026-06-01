@@ -26,6 +26,7 @@ const stepmod = @import("step.zig");
 const snapshotmod = @import("snapshot.zig");
 const input = @import("input.zig");
 const recorder = @import("recorder.zig");
+const migrate = @import("migrate.zig");
 
 // --- the control schedule -------------------------------------------------------------------------
 
@@ -114,7 +115,9 @@ pub fn ControlOutcome(comptime R: type) type {
 /// then `reload.reloadAt` by name (the World no-op), then unload the prior set AFTER the swap+recompute
 /// (the dlopen "valid only while open" hazard). `new_exec` is computed BEFORE freeing the old, so an error
 /// leaves `exec` pointing at the still-valid old slice (the caller's errdefer frees it exactly once).
-fn applyReload(
+/// Exported so the live control server's reload (control_server.doReload) is BIT-IDENTICAL to the
+/// replay/driver path — a single source for the swap semantics.
+pub fn applyReload(
     comptime R: type,
     gpa: Allocator,
     cur_set: *reload.SystemSet(R),
@@ -256,6 +259,159 @@ fn foldStream(comptime R: type, gpa: Allocator, stream: ?*std.hash.XxHash64, w: 
         std.mem.writeInt(u64, &b, (try w.digest(gpa)).hash, .little);
         s.update(&b);
     }
+}
+
+// --- the generic multi-phase session driver (reload + migrate across R-retyping boundaries) --------
+
+/// One phase of a multi-R session: its registry + the SetTable resolving reload ids IN THIS phase.
+pub fn Phase(comptime R_: type) type {
+    return struct {
+        pub const R = R_;
+        sets: SetTable(R),
+        start_set_id: u16 = 0,
+    };
+}
+
+/// A migration edge LEAVING phase i → phase i+1 (comptime-resolved). migration_id == departing phase index.
+pub fn MigrateEdge(comptime R_from: type, comptime R_to: type) type {
+    return struct {
+        pub const From = R_from;
+        pub const To = R_to;
+        chain: migrate.Chain,
+    };
+}
+
+pub const SessionError = RunError || migrate.MigrateError || error{ UnexpectedCompletion, TooManyMigrations, BadMigrationId };
+
+/// REPLAY a multi-R session from a frozen schedule, starting at comptime `phase_i` with an
+/// already-constructed `w0` for `phases[phase_i].R`. A `.migrate` is the ONLY thing that advances the
+/// phase — it tail-recurses into the NEXT R's monomorphization (the World type changes per phase, which a
+/// flat loop cannot express); `.completed` ends the session. NO Trigger parameter → structurally
+/// replay-only. Returns the FINAL World digest. Loud errors on an under/over/mis-migrated schedule.
+pub fn runSession(
+    comptime phases: anytype,
+    comptime edges: anytype,
+    comptime phase_i: usize,
+    gpa: Allocator,
+    w0: worldmod.World(@TypeOf(phases[phase_i]).R),
+    inputs: []const input.Input,
+    start_in: usize,
+    sched: ControlSchedule,
+    start_event: usize,
+    until_tick: u64,
+    stream: ?*std.hash.XxHash64,
+    rec: ?*recorder.Recorder,
+) SessionError!u64 {
+    const R = @TypeOf(phases[phase_i]).R;
+    const ph = phases[phase_i];
+    const oc = try runWithControl(R, gpa, w0, inputs, start_in, sched, start_event, ph.sets, ph.start_set_id, until_tick, stream, rec);
+    switch (oc) {
+        .completed => |w| {
+            var ww = w;
+            if (phase_i + 1 != phases.len) { // schedule under-migrated: a later phase was never reached
+                ww.deinit(gpa);
+                return error.UnexpectedCompletion;
+            }
+            defer ww.deinit(gpa);
+            return (try ww.digest(gpa)).hash;
+        },
+        .migrate => |m| {
+            var snap = m.pre;
+            defer snap.deinit(gpa);
+            if (phase_i + 1 >= phases.len) return error.TooManyMigrations; // migrate off the terminal phase
+            if (m.migration_id != phase_i) return error.BadMigrationId; // never a silent mis-route
+            const edge = edges[phase_i];
+            const RNext = @TypeOf(edge).To;
+            const w_next = try migrate.migrateWorld(RNext, gpa, edge.chain, snap.bytes);
+            return runSession(phases, edges, phase_i + 1, gpa, w_next, inputs, m.next_inputs_from, sched, m.resume_from, until_tick, stream, rec);
+        },
+    }
+}
+
+/// REPLAY a whole multi-R session: build the entry World via `seed0`, then drive phase 0 onward.
+pub fn runAllPhases(
+    comptime phases: anytype,
+    comptime edges: anytype,
+    gpa: Allocator,
+    seed0: *const fn (Allocator) anyerror!worldmod.World(@TypeOf(phases[0]).R),
+    inputs: []const input.Input,
+    sched: ControlSchedule,
+    until_tick: u64,
+    stream: ?*std.hash.XxHash64,
+    rec: ?*recorder.Recorder,
+) SessionError!u64 {
+    comptime std.debug.assert(edges.len == phases.len - 1);
+    const w0 = seed0(gpa) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.UnexpectedCompletion, // a seed-builder failure is surfaced, never swallowed
+    };
+    return runSession(phases, edges, 0, gpa, w0, inputs, 0, sched, 0, until_tick, stream, rec);
+}
+
+/// LIVE-CAPTURE twin of runSession: invokes per-phase exogenous triggers, capturing each op into `out`,
+/// crossing R-boundaries identically (snapshot → migrateWorld → recurse). `triggers` is a comptime tuple
+/// of Trigger(phases[i].R). Returns the FINAL World digest; `out` holds the captured ControlSchedule.
+pub fn captureSession(
+    comptime phases: anytype,
+    comptime edges: anytype,
+    comptime phase_i: usize,
+    gpa: Allocator,
+    w0: worldmod.World(@TypeOf(phases[phase_i]).R),
+    inputs: []const input.Input,
+    start_in: usize,
+    triggers: anytype,
+    until_tick: u64,
+    out: *std.ArrayList(ControlEvent),
+    out_gpa: Allocator,
+    stream: ?*std.hash.XxHash64,
+    rec: ?*recorder.Recorder,
+) SessionError!u64 {
+    const R = @TypeOf(phases[phase_i]).R;
+    const ph = phases[phase_i];
+    const oc = try captureWithControl(R, gpa, w0, inputs, start_in, triggers[phase_i], ph.sets, ph.start_set_id, until_tick, out, out_gpa, stream, rec);
+    switch (oc) {
+        .completed => |w| {
+            var ww = w;
+            if (phase_i + 1 != phases.len) {
+                ww.deinit(gpa);
+                return error.UnexpectedCompletion;
+            }
+            defer ww.deinit(gpa);
+            return (try ww.digest(gpa)).hash;
+        },
+        .migrate => |m| {
+            var snap = m.pre;
+            defer snap.deinit(gpa);
+            if (phase_i + 1 >= phases.len) return error.TooManyMigrations;
+            if (m.migration_id != phase_i) return error.BadMigrationId;
+            const edge = edges[phase_i];
+            const RNext = @TypeOf(edge).To;
+            const w_next = try migrate.migrateWorld(RNext, gpa, edge.chain, snap.bytes);
+            return captureSession(phases, edges, phase_i + 1, gpa, w_next, inputs, m.next_inputs_from, triggers, until_tick, out, out_gpa, stream, rec);
+        },
+    }
+}
+
+/// LIVE-CAPTURE a whole multi-R session: build the entry World via `seed0`, then capture from phase 0.
+pub fn captureAllPhases(
+    comptime phases: anytype,
+    comptime edges: anytype,
+    gpa: Allocator,
+    seed0: *const fn (Allocator) anyerror!worldmod.World(@TypeOf(phases[0]).R),
+    inputs: []const input.Input,
+    triggers: anytype,
+    until_tick: u64,
+    out: *std.ArrayList(ControlEvent),
+    out_gpa: Allocator,
+    stream: ?*std.hash.XxHash64,
+    rec: ?*recorder.Recorder,
+) SessionError!u64 {
+    comptime std.debug.assert(edges.len == phases.len - 1);
+    const w0 = seed0(gpa) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.UnexpectedCompletion,
+    };
+    return captureSession(phases, edges, 0, gpa, w0, inputs, 0, triggers, until_tick, out, out_gpa, stream, rec);
 }
 
 // --- the schedule codec (canonical, hostile-hardened) -----------------------------------------------
