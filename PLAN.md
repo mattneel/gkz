@@ -1582,3 +1582,436 @@ This subsection is authoritative where it differs from §15.1–§15.14 (which i
 8. **LOW acknowledged, not changed:** the C6 OOM sweep is arena-granular (the arena amortizes decode/instantiate allocations), so it fingerprints arena-ownership leak-freedom rather than per-logical-allocation; arena ownership is the model, so this is sufficient.
 
 Gate target as-built: **+13 content gate tests** folded into the base suite (6→ the content.zig unit/round-trip/ref/hostile/loose battery; the C1–C6 pinned cross-build + cross-arch witnesses in content_gate.zig). Pins `PIN_REF_LEVEL`/`PIN_REF_CRC`/`PIN_GEN7`/`PIN_HEADLESS_STREAM` hold across Debug/ReleaseSafe/ReleaseFast and all four cross arches.
+
+---
+
+## 16. The reload/migrate control trigger — the §12↔§13 connection (decision of record, from the design judge-panel)
+
+> **AS-BUILT NOTE (read §16.15 first).** The generic `runSession`/`runAllPhases` caller-loop helpers, the `Phase(R)` tuple type, and the `ControlSource(R)` convenience union were **NOT built** — they are demoted to declared v1.1 ergonomics. The multi-R phase walk ships as the CONCRETE, gated pattern (the gate's `replaySession`/`captureSession`, V1→V2); the generic `inline for`-over-a-comptime-phase-tuple helper is the genuine cost the design itself flagged (§16.14 residual #1) and is deferred. The mandated §12/§13 TRIGGER requirement — capture & replay of reload AND migrate at tick boundaries — is fully MET by `runWithControl`/`captureWithControl` + the gated session pattern (`runSession` is panel ergonomics, not a SPEC clause). Wherever §16.1/§16.4/§16.5/§16.10/§16.13 describe `runSession`/`runAllPhases`/`Phase`/`ControlSource` as built, read §16.15. §16.15 records every adversarial-review delta.
+
+4-architect / 4-lens judge panel + synthesis. **Base = `migrate-boundary`** (highest summed total; Judge#1's pick — the only design where never-re-invoke is *doubly* structural, two driver functions not one union arm, and the only one carrying **canonical bytes** across the migrate union rather than a live `World(R_old)`). Grafted with the verified corrections the other lenses flagged: Judge#3's decisive **`captureDynamic`-not-`captureStream`** gate primitive (the cited `run.captureStream` takes `comptime systems` and runs `stepExec`, so it *cannot* hash a mid-stream reload — `reload_gate.captureDynamic` over `stepDynamic` is the real witness); `reload.reloadAt` called **by name** at the swap site + `unload` ordered **after** the swap (the dlopen "valid only while open" hazard, reload.zig:86); `api-ergonomics`'s `runAllPhases` + `start_tick/until_tick` phase-bounding (the slickest mitigation for the one weak point — verbose caller dispatch); `capture-purist`'s **strictly-ascending** at_tick (reject equal, one-op-per-boundary as a permanent canonical invariant); and the dual `resume_from`/`next_inputs_from` cursor (eliminates the off-by-one resume bug a single index hides).
+
+Phase 8 built the **mechanisms** (`reloadAt`, `SystemSource`/`NativeLibSource`, `migrateWorld`, `Chain`); Phase 9 built the **control plane** (supervisor, qserver). Nothing yet *drives* reload or migrate. This section is the missing connection: a **captured, serializable, replayable control schedule** + a **deterministic driver** that applies it at tick boundaries + the **exogenous trigger seam** that emits ops captured into the schedule and is structurally unreachable on replay — the exact §10 agent-capture discipline transposed to control.
+
+### 16.1 New files, exports
+
+- **`src/control.zig`** (new; sibling of `reload.zig`/`migrate.zig`): `ControlOp`/`ControlEvent`/`ControlSchedule`, the canonical codec, `Trigger(R)`, `ControlSource(R)` (the replay|capture split), `SetTable(R)`, `ControlOutcome(R)`, `runWithControl` (replay/consume driver), `captureWithControl` (live driver), and the `runSession`/`runAllPhases` caller-loop helpers.
+- **`src/control_gate.zig`** (new; sibling of `reload_gate.zig`): the witness gate, wired into `zig build test` per-mode and re-checked by `zig build cross` under qemu on `{aarch64, s390x, arm, mips}` (the {32,64}-bit × {LE,BE} matrix), with `has_side_effects = true` so it is never cache-skipped.
+- **`root.zig`**: `pub const control = @import("control.zig");` plus `ControlOp`/`ControlSchedule`/`runWithControl`/`runSession`/`Trigger` re-exports.
+
+The driver adds **zero** code to the sim path: it is a fold over the existing `step.stepDynamic` (the runtime-systems twin of `stepExec`, certified equal tick-for-tick in step.zig). No new mechanism, no new determinism semantics on the spine.
+
+### 16.2 (1) ControlOp / ControlEvent / ControlSchedule
+
+```zig
+const std = @import("std");
+const serialize = @import("serialize.zig");
+const worldmod = @import("world.zig");
+const reload = @import("reload.zig");
+const schedule = @import("schedule.zig");
+const stepmod = @import("step.zig");
+const snapshotmod = @import("snapshot.zig");
+const migrate = @import("migrate.zig");
+const input = @import("input.zig");
+const recorder = @import("recorder.zig");
+
+/// A single control decision. NO R parameter — it names INTEGERS, not types/systems, so one
+/// ControlSchedule spans every phase of a multi-R run and is wire-serializable verbatim.
+pub const ControlOp = union(enum(u8)) {
+    /// Swap the running system set, SAME R. `set_id` indexes the live phase's SetTable(R).
+    reload: u16 = 0,
+    /// Advance the schema R_old -> R_new. `migration_id` indexes the caller's comptime schema graph.
+    migrate: u16 = 1,
+};
+
+/// One scheduled decision: apply `op` AT the boundary AFTER tick `at_tick` completes — i.e. between
+/// World@(at_tick) and World@(at_tick+1). `at_tick` is the tick NUMBER (matches `World.tick`, the value
+/// `stepDynamic` produces via `w.tick +%= 1`; u64, D2-wrapping-safe domain). The op never races a step.
+pub const ControlEvent = struct { at_tick: u64, op: ControlOp };
+
+/// The captured, replayable program of control decisions for a whole (possibly multi-R) run. Events are
+/// in STRICTLY ASCENDING at_tick — at most one op per boundary (a same-tick reload+migrate is expressed
+/// at adjacent ticks). This is the §12/§13 analog of `Run.inputs`: (seed, inputs, ControlSchedule)
+/// reproduces a run bit-exactly INCLUDING its reloads and migrations. Caller/arena-owned (like Run.inputs).
+pub const ControlSchedule = struct {
+    events: []const ControlEvent,
+    /// Linear scan; N is tiny (operator/watch-loop decisions, not per-tick). Exact at_tick match.
+    pub fn opAt(self: ControlSchedule, tick: u64) ?ControlOp {
+        for (self.events) |e| if (e.at_tick == tick) return e.op;
+        return null;
+    }
+};
+```
+
+**Id scheme — DECIDED.** Both ids are `u16` indices the **caller** owns, never the driver:
+- `reload set_id` indexes a phase-local `SetTable(R)` (a table of `reload.SystemSource(R)`; §16.6).
+- `migrate migration_id` indexes the caller's **comptime** schema-version graph: a tuple of `(migration_id, Chain, R_new, SetTable(R_new))` records (§16.5). The driver **never** interprets a `migration_id` — it cannot, it would need `R_new`; it only carries it out in `ControlOutcome.migrate` for the caller's comptime `switch` to dispatch. The driver **does** interpret a `set_id` (a same-R swap needs no re-typing).
+
+Why ids, not embedded chains/sets: a `migrate.Chain` is `[]const Migration` (schema-specific types) and a `SystemSet(R)` wraps `[]const Sys(R)` (R-parameterized fn-ptrs into code segments) — neither is fixed-width-serializable. The id is the serializable PROJECTION; the caller's comptime tables are the resolution. (This mirrors `input.Command.verb: u16` carrying a code, not a fn-ptr, and `proc/job.zig`'s `oracle_set_id`/`metric_id` ids over the OS boundary.)
+
+### 16.3 (2) runWithControl + ControlOutcome — the single-R driver
+
+```zig
+/// What ONE R-phase yielded. Cannot be a plain World(R): a migrate changes R, and a fn parameterized on
+/// R_old cannot construct a World(R_new). So `.migrate` hands the caller the PRE-migration World **as
+/// canonical bytes** (a Snapshot, NEVER a live World — the make-or-break property: even a LIVE run, after
+/// the boundary, is resumed by `runWithControl` consuming the SAME schedule from canonical bytes) plus the
+/// migration_id and the two resume cursors. The completed arm's World is caller-owned (must be deinit'd).
+pub fn ControlOutcome(comptime R: type) type {
+    return union(enum) {
+        completed: worldmod.World(R),               // schedule/budget exhausted at this R; final World
+        migrate: struct {                            // re-typing boundary reached
+            at_tick: u64,
+            migration_id: u16,
+            pre: snapshotmod.Snapshot,               // canonical bytes of World@(at_tick); caller deinits
+            resume_from: usize,                      // index into schedule.events to continue at
+            next_inputs_from: usize,                 // index into inputs to continue at
+        },
+    };
+}
+
+pub const RunError = serialize.Error || std.mem.Allocator.Error ||
+    error{ TooManySystems, BadSetId, NonMonotonicSchedule };
+
+/// Drive ONE R-phase: ticks via stepDynamic, applying scheduled ops at each tick boundary, until a
+/// MIGRATE op falls due (return `.migrate`) or `inputs[start_in..]` is exhausted / `until_tick` is hit
+/// (return `.completed`). This is the REPLAY/CONSUME entry — it takes a `ControlSchedule` only and has NO
+/// Trigger parameter, so the replay path is STRUCTURALLY incapable of invoking a live decider (§16.4).
+///   - reload op  -> swap the running set in place (same R), via the phase's SetTable; recompute exec.
+///   - migrate op -> snapshot World@(at_tick) to canonical bytes, return `.migrate{...}`.
+/// `inputs` is the FULL stream (shared across phases); the phase consumes `inputs[start_in..]`, defaulting
+/// to `input.EMPTY` past the end. `start_event` lets a resumed phase skip already-applied events.
+pub fn runWithControl(
+    comptime R: type,
+    gpa: std.mem.Allocator,
+    w0: worldmod.World(R),                  // consumed (ownership taken before first fallible call)
+    inputs: []const input.Input,
+    start_in: usize,
+    sched: ControlSchedule,
+    start_event: usize,
+    sets: SetTable(R),
+    start_set_id: u16,
+    start_tick: u64,                        // World.tick on entry (0 at genesis; carries across phases)
+    until_tick: u64,                        // stop when World.tick == until_tick (or a migrate), whichever first
+    rec: ?*recorder.Recorder,
+) RunError!ControlOutcome(R) {
+    var w = w0;
+    errdefer w.deinit(gpa);
+    var cur_set_id = start_set_id;
+    var cur_set = try sets.load(cur_set_id);                       // reload.SystemSet(R)
+    var exec = try schedule.execOrderDynamic(R, gpa, cur_set.systems);
+    errdefer gpa.free(exec);
+    var ev = start_event;
+    var prev_at: ?u64 = null;
+    var i = start_in;
+    while (w.tick < until_tick) : (i += 1) {
+        const in = if (i < inputs.len) inputs[i] else input.EMPTY;
+        const nxt = try stepmod.stepDynamic(R, gpa, w, in, cur_set.systems, exec, rec);
+        w.deinit(gpa);
+        w = nxt;                                                   // w.tick is now this tick's number (D2)
+        if (ev < sched.events.len and sched.events[ev].at_tick == w.tick) {
+            // defense-in-depth: a mis-built in-memory schedule that never round-tripped the codec.
+            if (prev_at) |p| if (w.tick <= p) return error.NonMonotonicSchedule;
+            prev_at = w.tick;
+            switch (sched.events[ev].op) {
+                .reload => |set_id| {
+                    const prev_id = cur_set_id;
+                    const next = try sets.load(set_id);            // BadSetId if out of range
+                    cur_set = reload.reloadAt(R, cur_set, next);   // BY NAME — the World no-op, grep-auditable
+                    cur_set_id = set_id;
+                    gpa.free(exec);
+                    exec = try schedule.execOrderDynamic(R, gpa, cur_set.systems);
+                    sets.unload(prev_id);                          // AFTER the swap+recompute (dlopen hazard)
+                    ev += 1;                                       // same R: keep looping
+                },
+                .migrate => |migration_id| {
+                    gpa.free(exec);
+                    const snap = try snapshotmod.snapshot(R, gpa, &w); // canonical bytes (= writeWorld)
+                    w.deinit(gpa);
+                    return .{ .migrate = .{
+                        .at_tick = w.tick, .migration_id = migration_id, .pre = snap,
+                        .resume_from = ev + 1, .next_inputs_from = i + 1,
+                    } };
+                },
+            }
+        }
+    }
+    gpa.free(exec);
+    return .{ .completed = w };
+}
+```
+
+`input.EMPTY` is a 1-line addition to input.zig (`pub const EMPTY = Input{ .tick = 0, .commands = &.{} }`) — the empty-input-per-tick default so the schedule, not the input array, bounds a phase.
+
+### 16.4 (3) The live/replay split — never-re-invoke is STRUCTURAL
+
+Mirrors `agent.asAgent`/`replayGen` (the replay path over `scriptedGen`, which discards `root`/`view`) vs `externalAgent` (live source + capture). The decisive design choice from the base: **two separate driver functions**, not one union arm. The replay driver `runWithControl` (§16.3) takes a `ControlSchedule` and has **no `Trigger` parameter at all** — the replay path cannot even be *handed* a trigger. The live driver wraps the identical loop but additionally consults a `Trigger` and **captures** what it emits before applying it (exactly as `buildRun` materializes `gen.next` into `Run.inputs`):
+
+```zig
+/// LIVE capture: identical to runWithControl, but at each tick boundary it consults `trigger` (exogenous)
+/// and, if it emits an op, APPENDS ControlEvent{w.tick, op} to `out` (ascending by construction) BEFORE
+/// applying it identically to the replay path. The schedule it builds is what replay later consumes —
+/// and on a migrate it returns the SAME `ControlOutcome.migrate` (canonical bytes), so the caller resumes
+/// via `runWithControl` even mid-live-run. There is deliberately NO constructor threading a Trigger into
+/// runWithControl, just as agent.zig has no constructor threading a live policy into the replay Run.
+pub fn captureWithControl(
+    comptime R: type, gpa: std.mem.Allocator, w0: worldmod.World(R),
+    inputs: []const input.Input, start_in: usize,
+    trigger: Trigger(R), sets: SetTable(R), start_set_id: u16,
+    start_tick: u64, until_tick: u64,
+    out: *std.ArrayList(ControlEvent), out_gpa: std.mem.Allocator,
+    rec: ?*recorder.Recorder,
+) RunError!ControlOutcome(R) {
+    // … identical loop to runWithControl, except the boundary handler is:
+    //   if (trigger.decide(w.tick, &w)) |op| { try out.append(out_gpa, .{ .at_tick = w.tick, .op = op });
+    //                                          applyOp(op) … }   // applyOp is the SAME reload/migrate arm
+    // The reload/migrate apply is SINGLE-SOURCED with runWithControl (a shared `applyOp`/`migrateReturn`
+    // helper), so a captured op and a replayed op cannot diverge.
+}
+```
+
+A convenience `ControlSource(R)` tagged union (`.replay: ControlSchedule` | `.capture: struct{trigger, out}`) is provided so a caller can pick the driver by tag; its `.replay` arm holds **no Trigger field**, so even the union form keeps never-re-invoke a property of the *type*. But the load-bearing guarantee is the two-function split: **the replay driver's signature contains no source.**
+
+### 16.5 (4) The migrate re-typing boundary + the caller loop
+
+A migrate re-types `R_old -> R_new`, so a single comptime-R loop **cannot** continue past it (`migrateWorld(comptime R_target, …)` is the only R-changing call in the kernel; Zig has no existential "World of some R"). The driver SURRENDERS via `ControlOutcome.migrate` carrying canonical bytes; the **caller**, which knows the schema graph at comptime, re-types and re-enters the driver on the new R:
+
+```zig
+/// The caller's comptime schema-graph phase: its registry, its set table, and the OUTBOUND edge
+/// (migration_id -> Chain) that leaves it. Each phase is monomorphized for its own R; the SCHEDULE
+/// (integer ids) spans all of them. `inline for` over a tuple of these is what lets one source loop
+/// instantiate runWithControl@R_old then runWithControl@R_new (each a distinct monomorphization).
+pub fn Phase(comptime Reg: type) type {
+    return struct { R: type = Reg, sets: SetTable(Reg), start_set_id: u16 = 0 };
+}
+
+/// Run a full multi-R session over a comptime-known phase chain `phases` (a tuple of `.{ .phase = Phase(Vk),
+/// .migration_id = k_to_k1, .chain = chain_k_k1 }` for each edge, terminated by a final phase with no edge).
+/// The schedule + inputs are shared across phases; the driver carries the dual resume cursors. Returns the
+/// final World's digest. This is the `runAllPhases` ergonomics graft: the per-phase ceremony lives behind
+/// an `inline for`, NOT a hand-written N-arm switch.
+pub fn runSession(comptime phases: anytype, gpa, inputs, sched, w0, total_ticks) !u64 {
+    // Sketch of the generated body (inline for over the comptime phase chain):
+    //   phase 0: oc = runWithControl(phases[0].phase.R, gpa, w0, inputs, 0, sched, 0,
+    //                                phases[0].phase.sets, phases[0].phase.start_set_id, 0, total_ticks, null);
+    //   inline for (phases, 0..) |p, k| switch (oc) {
+    //       .completed => |w| { defer w.deinit(gpa); return (try w.digest(gpa)).hash; },
+    //       .migrate => |m| {
+    //           comptime std.debug.assert(m.migration_id == p.migration_id); // graph edge check
+    //           defer { var s = m.pre; s.deinit(gpa); }                       // free the boundary snapshot
+    //           const NextR = phases[k+1].phase.R;
+    //           var wN = try migrate.migrateWorld(NextR, gpa, p.chain, m.pre.bytes); // THE re-type
+    //           oc = try runWithControl(NextR, gpa, wN, inputs, m.next_inputs_from, sched, m.resume_from,
+    //                                   phases[k+1].phase.sets, phases[k+1].phase.start_set_id,
+    //                                   m.at_tick, total_ticks, null);            // resume on NextR
+    //       },
+    //   };
+}
+```
+
+Key correctness, every point verified against the seams:
+- `migrate.migrateWorld(NextR, gpa, chain, m.pre.bytes)` (migrate/migrate.zig:234) is reused **verbatim**: it `image.decode`s the canonical bytes, `validateMigration`+`applyChain` folds the declared chain, `image.encode(NextR)` re-emits, then `readWorld(NextR)`+`fromParts`. The driver produced `m.pre.bytes` via `snapshot.snapshot` (= `writeWorld`), the exact image `migrateWorld` expects. The caller still owns `m.pre` and deinits it (migrate does not consume it).
+- **at_tick needs NO rekey across the boundary** — asserted invariant. `migrate.apply` passes `img.tick` through unchanged (migrate/migrate.zig:172; proven by the tick-preserved test at :433), so the V2 phase resumes at exactly `m.at_tick` and the schedule's later at_ticks (absolute) are found by the V2 driver. The gate asserts `phase[k+1] start_tick == m.at_tick` so a future migration op that *resets* tick is caught immediately rather than silently breaking the whole schedule.
+- The dual cursor (`resume_from` over events, `next_inputs_from` over inputs) is the graft that eliminates the off-by-one: the two streams index independently, so a migrate consumed at event index *e* resumes the next phase at *e+1* events / *i+1* inputs with no implicit alignment assumption.
+- On REPLAY the `migration_id` comes from the frozen schedule, so the identical `NextR`/`Chain` is dispatched; the comptime phase walk is reproduced bit-for-bit.
+
+### 16.6 (5) The reload swap mechanism
+
+`SetTable(R)` is the integer-indexed adapter over the existing `reload.SystemSource(R)` — adding only the lookup the schedule needs, reusing the loader verbatim:
+
+```zig
+pub fn SetTable(comptime R: type) type {
+    return struct {
+        sources: []const reload.SystemSource(R), // set_id is the index (inProcessSource OR NativeLibSource)
+        pub fn load(self: @This(), set_id: u16) error{BadSetId}!reload.SystemSet(R) {
+            if (set_id >= self.sources.len) return error.BadSetId;
+            // inProcessSource never fails; NativeLibSource's load may, but v1's gated path is in-process
+            // (see §16.10 — the resolve error set is narrowed to BadSetId by pre-loading; the dlopen
+            // path is the existing reload_gate's concern). The dlopen variant widens to anyerror.
+            return self.sources[set_id].load() catch return error.BadSetId;
+        }
+        pub fn unload(self: @This(), set_id: u16) void {
+            if (set_id < self.sources.len) self.sources[set_id].unload();
+        }
+    };
+}
+```
+
+On a `.reload set_id` boundary (§16.3) the driver: (1) `next = sets.load(set_id)` → `error.BadSetId` if out of range (never an OOB index); (2) `cur_set = reload.reloadAt(R, cur_set, next)` — called **by name**, the documented World no-op, keeping "no state moves on a swap" honest and grep-auditable at the call site; (3) `exec = execOrderDynamic(R, gpa, cur_set.systems)` (schedule.zig:132 — a pure function of the conflict matrix + registration order, never timing, `error.TooManySystems` in **all** build modes for >65535 systems); (4) `sets.unload(prev_id)` **after** the swap + recompute, never while the prior `.so`'s fn-ptrs could still run a tick (reload.zig:86 "valid only while open"). Subsequent ticks run `stepDynamic(R, …, cur_set.systems, exec, rec)`.
+
+Determinism is by construction (reload.zig:9–14): the swap touches **zero** World bytes, so reload-to-SAME is a bit-identical hash stream (reload.zig "reload-to-SAME … bit-identical" test generalized), and reload-to-DIFFERENT is an observable, reproducible trajectory divergence the VOPR oracle folds into a Defect. The trigger adds nothing to this — it only picks the at_tick and the set_id; the swap is the proven reload.zig mechanism.
+
+### 16.7 (6) The exogenous Trigger seam
+
+Shaped exactly like `agent.ExternalAgent` (external.zig:24): a bare `ctx` + fn-ptr, the §13 control-plane's sole contact for control decisions.
+
+```zig
+/// The EXOGENOUS live decider — an operator / watch loop / socket reactor OUTSIDE the determinism
+/// boundary. `decide` MAY read wall-clock, a socket, an operator console — anything — to choose whether to
+/// fire an op at THIS tick boundary. It gets a READ-ONLY *const World(R) view (it may INSPECT the sim —
+/// "migrate when entity count crosses N" — but CANNOT mutate it; this view is the ExternalAgent parity the
+/// design preserves). Its SOLE egress is the `?ControlOp` it returns, captured into the schedule. `root`/
+/// seed is deliberately NOT passed: an exogenous source makes no false promise of seed-reproducibility —
+/// reproducibility comes from CAPTURE, never from re-invoking it.
+pub fn Trigger(comptime R: type) type {
+    return struct {
+        ctx: *anyopaque,
+        decide_fn: *const fn (*anyopaque, u64, *const worldmod.World(R)) ?ControlOp,
+        pub fn decide(self: @This(), tick: u64, view: *const worldmod.World(R)) ?ControlOp {
+            return self.decide_fn(self.ctx, tick, view);
+        }
+    };
+}
+```
+
+INVOKED LIVE only from `captureWithControl` (§16.4), which appends the emitted op in the same statement (capture and emission are inseparable). NEVER reachable on replay: `runWithControl` has no `Trigger` parameter; `decide_fn` is not referenced on the replay path. **Clock vs sim path:** `decide_fn` may call `std.time.nanoTimestamp()` / read a socket — it lives OUTSIDE the determinism boundary (D3 "no clock on the sim path" is about `stepDynamic`, which the trigger is not part of). Its clock-reading influences ONLY *which* `(at_tick, op)` lands in the schedule; once captured, the op is tick-keyed data the sim path reads but never re-derives. The APPLIED op at a given tick is deterministic even though the DECISION to schedule it was clock-driven — the precise §13 promise.
+
+### 16.8 (7) Schedule serialization — the canonical, hostile-hardened codec
+
+Built on `serialize.putInt`/`getInt` (fixed-width, `assertFixedWidth`-guarded), with the `proc/job.zig` posture for §13-socket-sourced bytes: MAGIC + FORMAT version, strictly-ascending on encode AND decode, unknown-tag rejection, and an **incremental** parse where the count drives no pre-allocation.
+
+```zig
+pub const CONTROL_MAGIC = [5]u8{ 'G', 'K', 'Z', 'C', '1' };
+pub const CONTROL_FORMAT: u16 = 1;
+
+pub fn writeSchedule(sink: anytype, sched: ControlSchedule) !void {
+    try sink.update(&CONTROL_MAGIC);
+    try serialize.putInt(sink, u16, CONTROL_FORMAT);
+    try serialize.putInt(sink, u32, @intCast(sched.events.len));   // u32 count, never usize on the wire
+    var prev: ?u64 = null;
+    for (sched.events) |e| {
+        if (prev) |p| if (e.at_tick <= p) return error.Corrupt;    // STRICT ascending, <=1 op/tick (canonical)
+        prev = e.at_tick;
+        try serialize.putInt(sink, u64, e.at_tick);
+        try serialize.putInt(sink, u8, @intFromEnum(e.op));        // tag
+        switch (e.op) {
+            .reload => |id| try serialize.putInt(sink, u16, id),
+            .migrate => |id| try serialize.putInt(sink, u16, id),
+        }
+    }
+}
+
+pub fn readSchedule(gpa: std.mem.Allocator, reader: *serialize.ByteReader)
+    (serialize.Error || std.mem.Allocator.Error)!ControlSchedule {
+    const magic = try reader.readSlice(5);
+    if (!std.mem.eql(u8, magic, &CONTROL_MAGIC)) return error.BadMagic;
+    if (try serialize.getInt(reader, u16) != CONTROL_FORMAT) return error.UnsupportedFormat;
+    const n = try serialize.getInt(reader, u32);                   // attacker-controlled count
+    var list: std.ArrayList(ControlEvent) = .empty;                // INCREMENTAL: append after each full
+    errdefer list.deinit(gpa);                                     // record (>=11 bytes), so the count
+    var prev: ?u64 = null;                                         // drives no pre-alloc (anti-DoS, job.zig)
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const at = try serialize.getInt(reader, u64);
+        if (prev) |p| if (at <= p) return error.Corrupt;           // re-assert STRICT ascending on DECODE
+        prev = at;
+        const tag = try serialize.getInt(reader, u8);
+        const op: ControlOp = switch (tag) {
+            0 => .{ .reload = try serialize.getInt(reader, u16) },
+            1 => .{ .migrate = try serialize.getInt(reader, u16) },
+            else => return error.Corrupt,                          // unknown tag -> error, never UB
+        };
+        try list.append(gpa, .{ .at_tick = at, .op = op });
+    }
+    return .{ .events = try list.toOwnedSlice(gpa) };
+}
+```
+
+`Error` reuses `serialize.Error` (adds no new wire error set). The set/migration ids are NOT validated against the caller's tables here — that is the driver's apply-time concern (`BadSetId`) and the caller's comptime dispatch (an out-of-range edge is a comptime/`UnknownMigrationId` check), keeping the codec schema-agnostic like `image.zig`. **Precise guarantee** (correcting a panel overstatement): `assertFixedWidth` rejects ONLY `usize`/`isize` at the `putInt` boundary (serialize.zig:106-108); pointers/floats are simply never put on the wire because the op carries only a `u8` tag + `u16` ids + `u64` tick.
+
+### 16.9 (8) Determinism argument, including cross-arch
+
+A run is fully determined by the triple **(seed, inputs, ControlSchedule)** — every member is frozen data the sim path reads but never re-derives.
+- **Spine.** `stepDynamic` is the certified-deterministic runtime twin of `stepExec` (step.zig proves they match tick-for-tick), already cross-build/cross-arch bit-identical (replay.zig + cross gate).
+- **Reload.** A tick-boundary system-set swap, SAME R, a World no-op (reload.zig). Applied at the schedule's at_tick to the schedule's set_id → a pure function of the schedule. `execOrderDynamic` is a pure function of the conflict matrix + registration order, never timing. Replay reloads at the identical tick to the identical set ⇒ identical post-reload stream.
+- **Migrate.** Re-types via `migrateWorld` on the **canonical bytes** the driver snapshotted (= `writeWorld`). `migrateWorld`'s single determinism break-point is `image.encode`, canonical-by-construction and already cross-arch-PINNED by the migrate gate (a World digest AND an independent CRC32 family). The `migration_id` selects the identical chain + `NextR` on replay ⇒ identical re-typed World; the schedule continues unchanged across the phase boundary (at_tick preserved).
+- **Schema walk.** Driven by the schedule's `migration_id`s + a comptime graph, so live and replay walk identical phases in identical order, resuming at identical dual cursors.
+- **Clock off the sim path.** The only clock reader is `Trigger.decide`, invoked only from `captureWithControl` (live); `runWithControl` has no Trigger field and `stepDynamic`/the reload swap/`migrateWorld` never read a clock. The clock chooses only *which* (at_tick, op) enters the schedule at capture time; after capture the op is tick-keyed data.
+
+**Cross-arch.** The only new on-wire artifact is the `ControlSchedule`, encoded with `serialize.putInt` (fixed-width, little-endian, `assertFixedWidth`-guarded) — byte-identical on `aarch64/s390x/arm/mips` (the {32,64}-bit × {LE,BE} matrix); `s390x`/`mips` are the big-endian witnesses, `arm`/`mips` the 32-bit (no-usize-leak) witnesses. The migrate bytes are the already-cross-stable canonical image. No usize, pointer, or float touches any hashed or serialized stream. The witness run (reload@T1, migrate@T2, captured then replayed) is bit-identical per-tick AND final, across build modes AND the cross matrix.
+
+### 16.10 (9) Scope boundaries — v1 (MET) / declared seam / non-goal
+
+**v1 BUILT AND GATED — the mandated deterministic core (capture & replay of reload AND migrate at tick boundaries):**
+- `ControlOp`/`ControlEvent`/`ControlSchedule` + the hardened canonical codec (`writeSchedule`/`readSchedule` round-trip). **MET.**
+- `runWithControl` (replay/consume driver) + `ControlOutcome`, over `stepDynamic`/`execOrderDynamic`, applying reload in place and surrendering at the migrate boundary. **MET.**
+- `captureWithControl` (live driver) + the `Trigger(R)` seam + the two-function structural never-re-invoke split. **MET.**
+- `runSession`/`runAllPhases` caller loop dispatching `migration_id` → `migrateWorld(NextR)` → resume, spanning V1→V2(→V3). **MET.**
+- `SetTable(R)` over `reload.SystemSource` (in-process form gated; dlopen form proven by the existing `reload_gate`). **MET.**
+- The witness gate (§16.11): reload + migrate composed, captured then replayed bit-identical across the 3 build modes and the 4-arch matrix; tamper-trigger-never-called-on-replay; exogenous-clock-irrelevance; codec round-trip + hostile cases. **MET.**
+
+**DECLARED SEAMS (typed contact points built and tested; the outside integration named, NOT relabeled-mandated work — §13 marks the control plane EXOGENOUS):**
+- A concrete **watch-loop / socket-driven / operator-console `Trigger`**. `Trigger(R)` (ctx + decide_fn) IS the seam, built and gated; v1 ships an in-test deterministic Trigger (tick-threshold) PLUS a clock-reading Trigger proving the clock stays off the sim path PLUS a wire-shaped Trigger round-tripping its `ControlOp` through the codec (transport-readiness, à la `external.zig`'s `wireShapedInfer`). The production decider wiring a §13 `qserver` socket message to `decide` is control-plane plumbing on the defined seam — same status as `NativeLibSource` being built while the file-watcher that calls it is Phase-9 control plane.
+- The **`NativeLibSource`-backed `SetTable(R)`** for dlopen reloads: the seam exists (reload.zig); v1's base gate uses the in-process table to stay dlopen-free (the dlopen reload path is proven schedule-reproducible by an optional ELF/Linux-guarded `control_gate` case reusing `reload_example/*`, mirroring `reload_gate`'s build guard). The `SetTable.load` error set is narrowed to `BadSetId` for the in-process gated path; the dlopen variant widens to `anyerror` (reconciling reload.zig:53).
+
+**§14/§15 NON-GOALS (genuinely out of the kernel's scope, not deferred-mandated):**
+- Multi-machine / distributed control-schedule consensus — §13 is one-OS-process-per-sim. The codec is process-portable by design (the bytes cross the seam); the transport is §13 integration. **NON-GOAL** for the schedule core.
+- An operator GUI / live-tuning UI — presentation layer. **NON-GOAL.**
+- Proving opaque reloaded/migrated code internally deterministic — §15 trusts the author; the kernel DETECTS divergence (the VOPR oracle), it does not certify third-party logic. **NON-GOAL.**
+- Auto-recompiling edited source into a fresh `.so` — the swap + VOPR validation are identical regardless of what triggers the load; the rebuild toolchain is outside the kernel. **NON-GOAL.**
+
+### 16.11 (10) Determinism-hazards table (hazard → structural elimination)
+
+| # | Hazard | Eliminating mechanism |
+|---|--------|----------------------|
+| 1 | **Wall-clock leaks onto the sim path** | The only clock reader is `Trigger.decide`, reachable ONLY from `captureWithControl`; `runWithControl`/`stepDynamic`/the reload swap/`migrateWorld` never read a clock. The captured artifact is a tick-keyed integer op carrying no clock value. |
+| 2 | **Trigger re-invoked on replay (re-decides, diverges)** | DOUBLY structural: `runWithControl` has **no Trigger parameter** (cannot be handed one), and the `ControlSource.replay` arm has no Trigger field. Tamper-trigger gate (§16.11-test 3) asserts a divergent-on-re-invoke trigger is never called on replay (its counter stays put). |
+| 3 | **usize/pointer/float on the schedule wire (per-arch byte divergence)** | The op carries only `u8` tag + `u16` ids + `u64` tick via `serialize.putInt`, whose `assertFixedWidth` makes a usize/isize a COMPILE error. No SystemSet/Chain/fn-ptr is ever serialized — only its small-int id projection. |
+| 4 | **Op applied mid-step / at a racy moment** | Ops apply strictly at the boundary AFTER tick T completes (between World@T and World@T+1); the at_tick is the just-completed `w.tick`, a deterministic D2 value, never a clock or a re-decided instant. |
+| 5 | **Reload changes exec order nondeterministically** | After a swap, exec order is re-derived by `execOrderDynamic`, a pure function of the conflict matrix + registration order; identical swaps yield identical exec orders (proven == `Schedule.exec_order` in schedule.zig/reload.zig). |
+| 6 | **Migrate produces a non-canonical image** | The boundary snapshots to canonical bytes (`snapshot.snapshot` = `writeWorld`) and re-types via `migrateWorld`'s `image.encode`, canonical-by-construction and cross-arch PINNED in the migrate gate by BOTH a World digest AND an independent CRC32 family. Only `Snapshot` bytes cross the union — never a live World(R_old). |
+| 7 | **Schema-walk divergence (live takes a different path than replay)** | `migration_id` is captured in the schedule; replay dispatches the identical comptime `NextR`/chain via the same graph, resuming at the dual cursors. The schedule spans phases as R-agnostic ids. |
+| 8 | **Untrusted schedule bytes cause UB / DoS** | `readSchedule` checks MAGIC+FORMAT, rejects an unknown tag and a non-ascending at_tick (`error.Corrupt`), and parses incrementally so the u32 count drives no pre-allocation (each event ≥11 bytes); truncation is `error.Truncated` via `getInt`. |
+| 9 | **Cursor / at_tick misalignment across a phase boundary** | Dual cursors (`resume_from` over events, `next_inputs_from` over inputs) advance independently; `opAt`/the driver match by exact at_tick equality, so an event is consumed exactly once at exactly its tick. The migrate event is consumed when `.migrate` is returned (`resume_from = ev+1`). |
+| 10 | **Ambiguous schedule (two ops at one tick, or unsorted)** | STRICTLY-ascending at_tick enforced in BOTH `writeSchedule` and `readSchedule` AND a runtime `NonMonotonicSchedule` assert in the driver (defense-in-depth for a live-appended in-memory schedule that never round-tripped the codec). One op per boundary is a permanent canonical invariant; a same-tick reload+migrate is expressed at adjacent ticks. |
+| 11 | **Dangling .so fn-ptrs after unload at a swap** | The driver runs+snapshots BEFORE any unload; `SetTable.unload(prev_id)` runs AFTER the swap + exec recompute, never while the prior set could still run a tick (reload.zig:86). |
+| 12 | **Out-of-range set_id/migration_id from untrusted bytes** | Deterministic caught errors, never OOB: `SetTable.load` returns `error.BadSetId`; the caller's comptime dispatch / `migrateWorld`'s `validateMigration`+`SchemaMismatch` reject a wrong `migration_id` before any byte moves. |
+| 13 | **at_tick mis-keyed across the re-type (migrate resets tick)** | `migrate.apply` passes `img.tick` through unchanged (migrate/migrate.zig:172, test :433); the gate asserts `phase[k+1] start_tick == m.at_tick` so a future tick-resetting op is caught, not silently absorbed. |
+
+### 16.12 (11) The gate — exact test list (`control_gate.zig`)
+
+Modeled on `reload_gate.zig`/the migrate gate; reuses V1/V2/V3 from migrate/migrate.zig (the validated add-C / add-D edges) and two same-R sets per R (move_only ↔ move_and_jitter, as in reload.zig). The per-tick-hash primitive is **`reload_gate.captureDynamic`** (over `stepDynamic`) — promoted into `control.zig` (or shared) as the dynamic-stream witness — NOT `run.captureStream` (which is `comptime systems`/`stepExec` and cannot hash a reload run). Each test pins a frozen `u64` where applicable; the gate is in the 3-mode `test` step AND the 4-arch `cross` step.
+
+1. **RELOAD REPRODUCIBILITY.** Capture a run firing `.reload(set_id=1)` at T1 (move_only → move_and_jitter); freeze; replay from the SAME (seed, inputs, schedule) on a fresh world. Assert per-tick hash stream AND final digest bit-identical (`expectEqualSlices(u64,…)` + `streamDigest` equality). Assert the reload actually happened: post-T1 stream differs from a no-reload reference (reuse `oracle.firstDivergentTick`, div ≥ T1, identical pre-T1 prefix).
+2. **MIGRATE REPRODUCIBILITY.** Capture a run firing `.migrate(0)` at T2 (V1→V2); `runSession` re-types via `migrateWorld` and resumes on V2; freeze; replay. Assert the full cross-phase per-tick stream + the final V2 digest bit-identical between live and replay. Assert the pre-migration prefix equals a V1-only reference (boundary preserved state). Assert `phase-2 start_tick == T2` (the at_tick-preserved invariant, hazard #13).
+3. **RELOAD+MIGRATE COMPOSED.** Schedule `{reload@T1, migrate@T2}`; replay reproduces bit-exactly; PIN both a **per-phase sub-digest** (V1-phase and V2-phase, for localization) AND the concatenated cross-phase `streamDigest` + final.
+4. **TRIGGER-NEVER-RE-INVOKED (TAMPER).** A `tamperTrigger` (à la `external.zig`'s `impureInfer`) whose `decide_fn` increments an in-ctx `invoked` counter AND would emit a DIFFERENT op on re-invocation. `captureWithControl` runs it once (counter → K, op captured). Then `runWithControl` over the frozen schedule reproduces the SAME run while `invoked` STAYS K. Assert (a) replay stream == live stream bit-for-bit, (b) counter unchanged — direct structural witness (the type, not discipline).
+5. **EXOGENOUS-CLOCK-IRRELEVANCE.** A `clockTrigger` reading `std.time.nanoTimestamp()` (or a mock clock via ctx) to DECIDE when to fire. Capture twice at different wall times; assert that REPLAYING either frozen schedule yields the identical stream — the clock affected only capture, never replay.
+6. **CODEC ROUND-TRIP + HOSTILE.** `writeSchedule`→`readSchedule` identity on a multi-op schedule, AND a session driven by the decoded schedule equals one driven by the original (wire identity, not just struct equality). Hostile cases: `BadMagic`, `UnsupportedFormat`, unknown tag → `Corrupt`, non-ascending at_tick → `Corrupt`, truncated → `Truncated`.
+7. **CROSS-BUILD PIN.** Every pin above asserted unconditionally under Debug/ReleaseSafe/ReleaseFast (the replay.zig cross-build pattern).
+8. **CROSS-ARCH PIN.** The frozen `ControlSchedule` BYTES (`writeSchedule` output, XXH64) and the migrated-image CRC32 pinned and re-checked under `zig build cross` on aarch64/s390x/arm/mips (`xrun.has_side_effects = true`). The fixed-width codec + canonical image make these byte-identical per arch.
+
+Non-rubber-stamp: test 4 fails loudly if any refactor lets the replay path touch the trigger; tests 1–3 fail if a reload/migrate lands at the wrong tick; test 5 fails if the clock leaks into replay; the per-phase sub-digests (test 3) localize a cross-arch regression to a specific phase.
+
+### 16.13 (12) Ordered implementation checklist
+
+1. **`input.EMPTY`** — add the empty-input-per-tick const to input.zig (1 line; the schedule, not the input array, bounds a phase).
+2. **`control.zig` types + codec** — `ControlOp`/`ControlEvent`/`ControlSchedule`/`opAt`, `writeSchedule`/`readSchedule` (MAGIC+FORMAT, strict-ascending both ways, incremental decode). Unit test the round-trip + hostile cases first (no driver yet).
+3. **`SetTable(R)`** — the integer adapter over `reload.SystemSource(R)` (`load`→`BadSetId`, `unload`).
+4. **`Trigger(R)`** — the ctx + decide_fn seam; an in-test deterministic trigger + a tamper trigger + a clock trigger + a wire-shaped trigger.
+5. **`ControlOutcome(R)` + `runWithControl`** — the replay/consume driver (full body in §16.3): per-tick loop, `errdefer` on exec and world, `reloadAt` by name, `unload` after swap, `BadSetId` guard, snapshot-at-boundary into `.migrate.pre`, dual cursors, `NonMonotonicSchedule` assert. Extract the reload/migrate apply into a shared `applyOp` helper.
+6. **`captureWithControl`** — the live driver reusing the SAME `applyOp`, appending the trigger's emitted op before applying. (Optional `ControlSource(R)` union convenience over the two.)
+7. **`runSession`/`runAllPhases`** — the `inline for` caller loop over the comptime phase chain; `migrateWorld(NextR, …)` + resume; free `m.pre`.
+8. **`reload_gate.captureDynamic`** → promote into `control.zig` (or a shared `control_gate` helper) as the dynamic per-tick-hash witness.
+9. **`control_gate.zig`** — tests 1–8 (§16.12); pin the digests via a `dumpControlPin` dev utility (the reload_gate pattern).
+10. **build.zig** — wire `control_gate.zig` per-mode into `test` (separate artifact, `has_side_effects = true`) and into the `cross` step's root suite; optional ELF/Linux-guarded dlopen reload case reusing `reload_example/*`.
+11. **root.zig** — `pub const control` + the headline re-exports.
+
+### 16.14 (13) Residual risks
+
+- **Caller phase-walk ergonomics (the design's genuine cost).** Because a migrate is a real re-typing boundary and R is comptime, the caller cannot express an arbitrary-length chain of distinct R's in one runtime loop — `runSession` is an `inline for` over a comptime phase chain, and an irregular graph (diamonds, multiple out-edges per node) makes the comptime edge dispatch verbose and easy to get subtly wrong (a wrong Chain for a `migration_id` is caught at runtime by `migrateWorld`'s `from_version==running` + target-fingerprint asserts, not at comptime). The `runAllPhases` helper contains the *common* linear case; a branching schema graph is the place a real implementation most likely needs a second iteration. Tests 2/3 are designed to catch a mis-wired phase; the dual cursor removes the off-by-one class.
+- **Recorder across a migrate (named seam).** `snapshot` is World-only, so an in-flight provenance event log is dropped at the boundary — each R-phase needs its own `Recorder` segment (each phase has R-typed event kinds anyway). v1 gates the `rec == null` path; the per-phase Recorder segmentation policy is a declared seam, not a silent provenance hole.
+- **dlopen `SetTable` lifetime under a long multi-phase run.** `NativeLibSource.load` returns fn-ptrs valid only while open; v1 unloads after the swap and gates the in-process table. A production dlopen reload across many phases needs an explicit ownership policy (which `.so` handles stay open across which ticks) — the seam is defined (reload.zig), the long-lived-handle policy is control-plane integration.
+- **Same-tick compound op.** The one-op-per-boundary invariant is treated as permanent; a reload+migrate "at the same instant" is expressed at adjacent ticks. If a future requirement genuinely needs an atomic same-tick compound op, it would need a secondary intra-tick order key on the wire — flagged as an ergonomics question, not a v1 gap.
+
+### 16.15 Adversarial-review notes (19 confirmed / 0 refuted; the 2 HIGH + substantive MEDIUM/LOW fixed; the AS-BUILT record)
+
+Authoritative where it differs from §16.1–§16.14 (the panel's design intent verbatim).
+
+1. **HIGH — codec accepted `at_tick == 0`, which the driver can never apply, silently wedging the whole schedule (real bug, fixed).** Ops apply at the boundary AFTER a tick completes, so the lowest reachable boundary is tick 1; `stepDynamic` does `w.tick +%= 1` then the driver matches `events[ev].at_tick == w.tick`. An event at `at_tick = 0` never matched, and since the cursor only advanced on a match it WEDGED — every later event (e.g. a real migrate) was also dropped and the phase silently ran to `until_tick`. The capture path could never produce it and the gate used T1=3/T2=6, so a green gate masked it (the hostile/socket-sourced-schedule case §16.8 targets). **Fixed two ways:** `writeSchedule`/`readSchedule` now reject `at_tick == 0` (`error.Corrupt`); and the driver's dead `prev_at`/`NonMonotonicSchedule` guard (which, per finding #7/#8, could never fire) was replaced by a **past-due check** — `if (events[ev].at_tick < w.tick) return error.NonMonotonicSchedule` — so any unreachable/non-ascending/stale in-memory event fails LOUDLY instead of silently dropping the rest. Witness: gate **K6**.
+2. **HIGH — `runSession`/`runAllPhases`/`Phase(R)`/`ControlSource(R)`/the wire-shaped Trigger were claimed MET in §16 but absent from the code (claimed-but-absent; the §15.15 `field_path` case again).** The multi-R phase walk ships ONLY as the concrete, gated `replaySession`/`captureSession` in `control_gate.zig` (V1→V2), not as a reusable generic in `control.zig`, and `root.zig` does not re-export `runSession`. **Reconciled honestly (the AS-BUILT note above + this):** demoted to declared v1.1 ergonomics. They are panel-added convenience, NOT a SPEC clause — the §12/§13 TRIGGER requirement (capture & replay of reload AND migrate at tick boundaries) is fully MET by `runWithControl` + `captureWithControl` + the gated concrete session pattern. The generic `inline for`-over-comptime-phase-tuple helper is the genuine cost the design itself flagged (§16.14 residual #1); a branching schema graph is exactly where it would need a second iteration, so it is deferred rather than half-built.
+3. **MEDIUM — dlopen `SetTable` handles were never unloaded at phase end (fixed).** A `NativeLibSource`-backed set loaded at entry (or by a reload) was unloaded only by the NEXT reload; the FINAL active set leaked its `.so` handle on `.completed`/`.migrate`. Both drivers now `sets.unload(cur_set_id)` before each return, pairing every load with exactly one unload (`applyReload` unloads the prior set; phase-end unloads the last). A no-op for `inProcessSource`; correct for dlopen.
+4. **MEDIUM — the tamper trip-wire was inert and the codec test under-covered the decode side (fixed).** `decideTamper`'s divergence threshold is now `t.invoked <= T2` (the actual live invocation count), so a re-invocation on replay would emit a divergent op — making the trip-wire reachable-in-principle (the counter-unchanged assert remains the load-bearing witness). `control.zig` gained a decode-side hostile battery: unknown tag, `at_tick == 0`, decode-side non-ascending, and bad version — each via a hand-built byte stream (not just the encode-side checks).
+5. **LOW (addressed / accepted):** K4's exogenous decider is documented as a deterministic MOCK CLOCK (a real `nanoTimestamp` trigger is intentionally avoided — its schedule is unpinnable; the clock-off-the-sim-path guarantee is structural via the no-Trigger-parameter signature). The control-path final-state pin is XXH64-only; a second hash family is NOT added here because the migrate boundary reuses `migrateWorld`, whose image is already CRC32-pinned (independent family) by the migrate gate upstream. The §16.11 hazard-#2 phrasing cites a `ControlSource.replay` arm that was not built — the real (and sufficient) guarantee is the two-function split: `runWithControl` has no `Trigger` parameter.
+
+Gate as-built: **8 control tests** folded into the base suite (control.zig codec round-trip + decode-hostile + opAt; control_gate.zig K1–K6 + dumpPin), with `PIN_FINAL`/`PIN_STREAM`/`PIN_SCHED_BYTES` holding across Debug/ReleaseSafe/ReleaseFast and all four cross arches.

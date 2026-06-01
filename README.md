@@ -279,6 +279,27 @@ emits an explicit, auditable ref-patch for each — never a blind reflection rew
 art and no asset table.** (Mid-tick prefab spawning, ZON authoring, and asset *import* are declared
 seams/non-goals — see PLAN §15.)
 
+### The reload/migrate control trigger (SPEC §12↔§13)
+
+| Module | Responsibility |
+|---|---|
+| `control.zig` | `ControlSchedule` (captured `(at_tick, reload\|migrate)` ops) + canonical codec; `runWithControl` (replay driver, **no trigger param**) and `captureWithControl` (live driver + capture); `Trigger(R)` (the exogenous decider); `SetTable(R)` over `reload.SystemSource` |
+
+Phase 8 built the reload/migrate *mechanisms* and Phase 9 the control plane; this is the missing
+*trigger* — what decides **when** to reload or migrate, reproducibly. The decision is **exogenous** (an
+operator/watch loop reacting to wall-clock or external signals, off the sim path) but determinism is
+**preserved** by the same capture discipline as agents (§10): the live `Trigger` is invoked by
+`captureWithControl`, which records each `(tick, op)` into a `ControlSchedule`; **replay consumes the
+schedule via `runWithControl`, which has no trigger parameter and is structurally incapable of
+re-invoking the live decider.** A run is determined by the triple **(seed, inputs, ControlSchedule)**. A
+**reload** swaps the running system set in place (same `R`, a `reloadAt` World no-op); a **migrate** is a
+re-typing boundary (`R_old→R_new`) — the driver snapshots to canonical bytes and surrenders, the caller
+`migrateWorld`s and resumes. The gate witnesses it: a reload+migrate captured live then replayed from the
+schedule is bit-identical and cross-arch-pinned; a tamper trigger that would diverge if re-invoked is
+never called on replay (its counter stays put); a clock-reading decider influences only *which* ops are
+captured, never replay. (The generic multi-phase `runSession` helper, a socket-driven live trigger, and
+multi-machine are declared v1.1/seams — see PLAN §16.15.)
+
 ### Determinism contract (the spine)
 
 `step` is pure; the World is a value; all randomness is a keyed, counter-based pure function; the
@@ -305,7 +326,8 @@ contract:
 - **Phase 9** — Process model & control plane (§13): one-process-per-sim supervisor pool, cross-process sweep sharding, crash-as-repro harvesting, the query server ✅
 - **Phase 10** — Content as data (§11): `Prefab`/`Level` as diffable records, deterministic instantiation (a pinned loaded-World digest, cross-arch), seeded proc-gen, asset-handles-as-data (headless-first) ✅
 - **Cross-architecture determinism gate** (`zig build cross`): every pin re-checked under qemu on aarch64/s390x/arm/mips — the {32,64}-bit × {LE,BE} matrix ✅
-- **Next** — distributing workers to **other machines** (a `NetworkExecutor` over the same job/result frames; needs a second host to gate), plus the control-plane refinements: a watch-driven reload/migrate **trigger** (into Phase 8's `SystemSource` seam) and socket auth — all behind the `Executor`/`SystemSource` seams built here
+- **Reload/migrate control trigger** (§12↔§13, `control.zig`): a captured, replayable `ControlSchedule`; reload+migrate driven reproducibly at tick boundaries; the exogenous trigger captured live and never re-invoked on replay (cross-arch pinned) ✅
+- **Next** — distributing workers to **other machines** (a `NetworkExecutor` over the same job/result frames; needs a second host to gate); plus the remaining control-plane integration on the seams built here: a **socket/watch-driven** live `Trigger`, the generic multi-phase `runSession`, and socket auth
 
 See [`PLAN.md`](./PLAN.md) §6 for the full phase map.
 

@@ -171,6 +171,20 @@ pub const loadLevel = content.loadLevel;
 pub const instantiate = content.instantiate;
 pub const localRef = content.localRef;
 
+// The §12↔§13 reload/migrate control trigger (PLAN §16): a captured, replayable ControlSchedule of
+// (tick, reload|migrate) decisions + a deterministic driver; the exogenous Trigger is captured live and
+// never re-invoked on replay. Reproducibility = (seed, inputs, ControlSchedule).
+pub const control = @import("control.zig");
+pub const ControlOp = control.ControlOp;
+pub const ControlEvent = control.ControlEvent;
+pub const ControlSchedule = control.ControlSchedule;
+pub const Trigger = control.Trigger;
+pub const SetTable = control.SetTable;
+pub const runWithControl = control.runWithControl;
+pub const captureWithControl = control.captureWithControl;
+pub const writeSchedule = control.writeSchedule;
+pub const readSchedule = control.readSchedule;
+
 /// Bring-up placeholder so the scaffold `main.zig` keeps compiling during Phase 1. Replaced by a real
 /// kernel demo once `step`/`snapshot`/`replay` land.
 pub fn printAnotherMessage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -198,6 +212,8 @@ test {
     _ = @import("step_par_gate.zig");
     _ = content;
     _ = @import("content_gate.zig");
+    _ = control;
+    _ = @import("control_gate.zig");
     _ = snapshot_mod;
     _ = replay_mod;
     _ = event;

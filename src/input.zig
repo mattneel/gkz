@@ -32,6 +32,10 @@ pub const Input = struct {
     commands: []const Command,
 };
 
+/// The empty input — no commands. Drivers (e.g. control.runWithControl) default to this past the end of
+/// an input stream, so a control schedule (not the input array length) bounds how long a phase runs.
+pub const EMPTY = Input{ .tick = 0, .commands = &.{} };
+
 fn lessThan(_: void, a: Command, b: Command) bool {
     if (a.actor.index != b.actor.index) return a.actor.index < b.actor.index;
     return a.verb < b.verb;
