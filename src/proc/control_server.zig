@@ -56,24 +56,18 @@ pub fn ControlServer(comptime R: type, comptime systems: []const Sys(R)) type {
 
         /// A live, MUTABLE sim the server drives. Owns its World, its provenance recorder (whose `.log`
         /// backs the read-only query surface — so a live-stepped sim is fully observable), and its active
-        /// system set + exec order + set_id (mutated in place by reload). `owns_set` records whether THIS
-        /// sim performed the `sets.load(set_id)` that must be paired with a `sets.unload` at teardown: a
-        /// spawned sim owns its load; a FORKED sim BORROWS the parent's already-loaded set (no second load),
-        /// so it must NOT unload. Under `inProcessSource` load/unload are no-ops and the set is a static
-        /// slice; under a real `NativeLibSource`, sharing one `.so` handle across concurrent sims (a fork
-        /// borrowing the parent's set, or a parent reload invalidating a fork's borrowed systems) needs
-        /// reference-counted handles that v1 does NOT implement — a declared non-goal (the dlopen
-        /// "valid only while open" hazard), consistent with `control.zig`'s single-sim unload discipline.
+        /// system set + exec order + set_id (mutated in place by reload). Every sim holds exactly ONE
+        /// `acquireSet(set_id)` reference for its CURRENT set_id (spawn/fork acquire; reload swaps; teardown
+        /// /migrate release) — see the refcount below.
         pub const OwnedSim = struct {
             world: World,
             rec: recorder.Recorder,
             set: reload.SystemSet(R),
             exec: []u16,
             set_id: u16,
-            owns_set: bool,
 
-            // deinit frees only what the sim allocates directly; the active set's `sets.unload` (paired with
-            // the spawn load) is the SERVER's responsibility (it holds `sets`) — see Self.deinit / .migrate.
+            // deinit frees only what the sim allocates directly; releasing the set's `acquireSet` reference
+            // (which unloads the dlopen handle at the last release) is the SERVER's job — see Self.deinit.
             fn deinit(s: *OwnedSim, gpa: Allocator) void {
                 gpa.free(s.exec);
                 s.world.deinit(gpa);
@@ -82,25 +76,75 @@ pub fn ControlServer(comptime R: type, comptime systems: []const Sys(R)) type {
             }
         };
 
+        /// One refcounted loaded set. Multiple in-process sims (a parent + its forks, or several spawns of
+        /// the same id) SHARE one `reload.SystemSet(R)` — critical for a real `NativeLibSource`, whose `.so`
+        /// is a SINGLE handle (a 2nd `load` is `AlreadyLoaded`, and unloading it while a sibling still
+        /// references its fn-ptrs is a use-after-unload). The handle is `sets.load`ed at the first acquire
+        /// and `sets.unload`ed at the last release. Under `inProcessSource` load/unload are no-ops, so this
+        /// is pure bookkeeping (the set is a static slice). `control.applyReload`'s single-sim unload
+        /// discipline is the one-process-per-sim (§13) analog; this is its in-process multi-sim generalization.
+        const LoadedSet = struct { set: reload.SystemSet(R), rc: u32 };
+
         gpa: Allocator,
         sets: control.SetTable(R),
         sims: std.AutoHashMapUnmanaged(u32, *OwnedSim) = .empty,
+        loaded: std.AutoHashMapUnmanaged(u16, LoadedSet) = .empty,
         fp_bytes: []const u8,
+        /// The capability secret a client's `hello.token` must equal before any command is serviced over a
+        /// `serveSession` connection. `null` = open (fingerprint-only). Borrowed; the caller owns its bytes.
+        auth_token: ?[]const u8 = null,
 
         pub fn init(gpa: Allocator, sets: control.SetTable(R)) Allocator.Error!Self {
             return .{ .gpa = gpa, .sets = sets, .fp_bytes = try fingerprintBytes(R, gpa) };
         }
 
+        /// True iff the handshake is acceptable: the client's R-fingerprint matches AND (no secret is
+        /// configured OR the client's token matches it). A constant-time token compare keeps a wrong-length
+        /// or wrong-value token from leaking via early exit.
+        fn handshakeOk(self: *const Self, fp: []const u8, token: []const u8) bool {
+            if (!std.mem.eql(u8, fp, self.fp_bytes)) return false;
+            const secret = self.auth_token orelse return true;
+            if (token.len != secret.len) return false;
+            var diff: u8 = 0;
+            for (token, secret) |a, b| diff |= a ^ b;
+            return diff == 0;
+        }
+
         pub fn deinit(self: *Self) void {
             var it = self.sims.valueIterator();
             while (it.next()) |sp| {
-                if (sp.*.owns_set) self.sets.unload(sp.*.set_id); // pair the spawn/reload load (dlopen handle)
+                self.releaseSet(sp.*.set_id); // last release of each set_id unloads its handle
                 sp.*.deinit(self.gpa);
                 self.gpa.destroy(sp.*);
             }
             self.sims.deinit(self.gpa);
+            self.loaded.deinit(self.gpa); // every entry should already be at rc 0 + removed by releaseSet
             self.gpa.free(self.fp_bytes);
             self.* = undefined;
+        }
+
+        /// Acquire a refcounted reference to `set_id`'s loaded set (loading it on the first acquire). The
+        /// returned `SystemSet(R)` is shared — callers must NOT unload it directly; pair with `releaseSet`.
+        fn acquireSet(self: *Self, set_id: u16) ServerError!reload.SystemSet(R) {
+            if (self.loaded.getPtr(set_id)) |ls| {
+                ls.rc += 1;
+                return ls.set;
+            }
+            const set = try self.sets.load(set_id); // BadSetId (or a loader error mapped to it)
+            errdefer self.sets.unload(set_id);
+            try self.loaded.put(self.gpa, set_id, .{ .set = set, .rc = 1 });
+            return set;
+        }
+
+        /// Release one reference to `set_id`; the last release unloads the handle (dlopen) and drops the
+        /// cache entry. Safe to call for an id the server loaded; a no-op for an unknown id.
+        fn releaseSet(self: *Self, set_id: u16) void {
+            const ls = self.loaded.getPtr(set_id) orelse return;
+            ls.rc -= 1;
+            if (ls.rc == 0) {
+                self.sets.unload(set_id);
+                _ = self.loaded.remove(set_id);
+            }
         }
 
         /// Take ownership of `w0` as a new live sim under `sim_id`, running `start_set_id`. The caller's
@@ -109,13 +153,13 @@ pub fn ControlServer(comptime R: type, comptime systems: []const Sys(R)) type {
             var w = w0;
             errdefer w.deinit(self.gpa);
             if (self.sims.contains(sim_id)) return error.BadSetId; // sim_id collision (caller error)
-            const set = try self.sets.load(start_set_id);
-            errdefer self.sets.unload(start_set_id); // pair the load on every failure-after-load path
+            const set = try self.acquireSet(start_set_id); // refcounted load (BadSetId)
+            errdefer self.releaseSet(start_set_id); // pair the acquire on every failure-after-acquire path
             const exec = try schedule.execOrderDynamic(R, self.gpa, set.systems);
             errdefer self.gpa.free(exec);
             const os = try self.gpa.create(OwnedSim);
             errdefer self.gpa.destroy(os);
-            os.* = .{ .world = w, .rec = recorder.Recorder.init(self.gpa), .set = set, .exec = exec, .set_id = start_set_id, .owns_set = true };
+            os.* = .{ .world = w, .rec = recorder.Recorder.init(self.gpa), .set = set, .exec = exec, .set_id = start_set_id };
             try self.sims.put(self.gpa, sim_id, os);
         }
 
@@ -139,9 +183,9 @@ pub fn ControlServer(comptime R: type, comptime systems: []const Sys(R)) type {
         /// `DecodedCommand` arena). `hello` is advisory HERE — it REPORTS whether the client's R-fingerprint
         /// matches; ENFORCEMENT (refusing a non-matching client) is `serveSession`'s job.
         fn dispatch(self: *Self, gpa: Allocator, sim_id: u32, cmd: cw.ControlCommand, out: *serialize.ByteSink) (serialize.Error || Allocator.Error)!void {
-            // hello carries no sim — it's the R-handshake.
+            // hello carries no sim — it's the R-fingerprint + capability-token handshake.
             if (cmd == .hello) {
-                const ok = std.mem.eql(u8, cmd.hello, self.fp_bytes);
+                const ok = self.handshakeOk(cmd.hello.fingerprint, cmd.hello.token);
                 return cw.writeResponse(out, .{ .hello_ok = .{ .ok = ok } });
             }
 
@@ -169,7 +213,7 @@ pub fn ControlServer(comptime R: type, comptime systems: []const Sys(R)) type {
                     return cw.writeResponse(out, .{ .stepped = .{ .tick = sim.world.tick, .digest = d } });
                 },
                 .reload => |r| {
-                    control.applyReload(R, self.gpa, &sim.set, &sim.set_id, &sim.exec, self.sets, r.set_id) catch |e| switch (e) {
+                    self.reloadSim(sim, r.set_id) catch |e| switch (e) {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.BadSetId => return cw.writeResponse(out, .{ .err = .bad_set_id }),
                         error.TooManySystems => return cw.writeResponse(out, .{ .err = .bad_set_id }),
@@ -184,6 +228,9 @@ pub fn ControlServer(comptime R: type, comptime systems: []const Sys(R)) type {
                         else => return cw.writeResponse(out, .{ .err = .bad_command }),
                     };
                     self.sims.put(self.gpa, f.new_sim_id, child) catch {
+                        // forkSim already acquired child.set_id (rc++); release it here (BEFORE deinit, which
+                        // sets child.* = undefined) or the refcount orphans and the handle never unloads.
+                        self.releaseSet(child.set_id);
                         child.deinit(self.gpa);
                         self.gpa.destroy(child);
                         return error.OutOfMemory;
@@ -205,7 +252,7 @@ pub fn ControlServer(comptime R: type, comptime systems: []const Sys(R)) type {
                     const at = sim.world.tick;
                     try cw.writeResponse(out, .{ .migrated = .{ .migration_id = m.migration_id, .at_tick = at, .bytes = snap.bytes } });
                     _ = self.sims.remove(sim_id);
-                    if (sim.owns_set) self.sets.unload(sim.set_id); // release the dlopen handle on surrender
+                    self.releaseSet(sim.set_id); // drop this sim's set reference (unloads the handle at the last)
                     sim.deinit(self.gpa);
                     self.gpa.destroy(sim);
                     return;
@@ -228,17 +275,34 @@ pub fn ControlServer(comptime R: type, comptime systems: []const Sys(R)) type {
             }
         }
 
+        /// Swap `sim`'s running set to `new_id` IN PLACE (same R) — the refcount-aware analog of
+        /// `control.applyReload`, with identical World semantics (`reloadAt` is a documented World no-op +
+        /// `execOrderDynamic` recompute), so a live reload and the replay driver's reload reach the same
+        /// World. Acquires the new reference BEFORE releasing the old (a reload-to-same keeps the handle
+        /// loaded), and computes the new exec BEFORE freeing the old (an error leaves `sim` intact).
+        fn reloadSim(self: *Self, sim: *OwnedSim, new_id: u16) ServerError!void {
+            const newset = try self.acquireSet(new_id); // refcounted load (BadSetId)
+            errdefer self.releaseSet(new_id); // undo the acquire if the exec recompute fails
+            const new_exec = try schedule.execOrderDynamic(R, self.gpa, newset.systems); // TooManySystems; old exec intact
+            const old_id = sim.set_id;
+            self.gpa.free(sim.exec);
+            sim.exec = new_exec;
+            sim.set = reload.reloadAt(R, sim.set, newset); // BY NAME — the documented World no-op
+            sim.set_id = new_id;
+            self.releaseSet(old_id); // AFTER the swap (never unload a handle whose fn-ptrs just ran a tick)
+        }
+
         /// §6 fork: branch `parent` into an INDEPENDENT child (via a snapshot round-trip), then advance it
         /// `tick_budget` ticks under `diverged_inputs`. The child coexists with the parent — a divergent
-        /// timeline. It BORROWS the parent's already-loaded set (no second `sets.load`, so no double-load /
-        /// `AlreadyLoaded` under a real loader, and `owns_set=false` so teardown does not double-unload).
+        /// timeline. It ACQUIRES its own refcounted reference to the parent's set_id (sharing one dlopen
+        /// handle via the refcount, so no `AlreadyLoaded`, and the handle outlives WHICHEVER sim is torn
+        /// down first — fixing the parent-teardown-dangles-fork hazard a raw borrow had).
         ///
         /// Ownership is built into `os` field-by-field so every errdefer targets `os`'s LIVE world — the
         /// advance loop reassigns `os.world`, and `errdefer os.world.deinit(gpa)` always frees exactly the
-        /// current one (never a stale value-copy aliasing freed memory — the bug a separate `cworld` errdefer
-        /// would reintroduce). A mid-loop OOM thus frees the in-flight world ONCE and leaks nothing. Uses
-        /// `self.gpa` (the sim-owning allocator), so the child the caller registers + later `deinit`s under
-        /// `self.gpa` is single-allocator-consistent (never created under one allocator, freed under another).
+        /// current one (never a stale value-copy aliasing freed memory). A mid-loop OOM frees the in-flight
+        /// world ONCE and leaks nothing. Uses `self.gpa` (the sim-owning allocator) throughout, so the child
+        /// the caller registers + later `deinit`s under `self.gpa` is single-allocator-consistent.
         fn forkSim(self: *Self, parent: *OwnedSim, tick_budget: u64, diverged_inputs: []const input.Input) ServerError!*OwnedSim {
             const gpa = self.gpa;
             const os = try gpa.create(OwnedSim);
@@ -253,10 +317,10 @@ pub fn ControlServer(comptime R: type, comptime systems: []const Sys(R)) type {
                 os.world = World.fromParts(parts);
             }
             errdefer os.world.deinit(gpa); // from here `os` is the SOLE owner of the in-flight world
-            os.set = parent.set; // BORROW the parent's loaded set (see OwnedSim.owns_set)
+            os.set = try self.acquireSet(parent.set_id); // refcounted share of the parent's set (rc++)
+            errdefer self.releaseSet(parent.set_id);
             os.set_id = parent.set_id;
-            os.owns_set = false;
-            os.exec = try schedule.execOrderDynamic(R, gpa, parent.set.systems);
+            os.exec = try schedule.execOrderDynamic(R, gpa, os.set.systems);
             errdefer gpa.free(os.exec);
 
             var k: u64 = 0;
@@ -280,10 +344,10 @@ pub fn ControlServer(comptime R: type, comptime systems: []const Sys(R)) type {
         /// a real control plane: an AI drives a SEQUENCE of mutations over one connection, the sim evolving
         /// across them. Run alongside the client in an `Io.Group` (the proc gate does exactly this).
         ///
-        /// ENFORCES the hello handshake (`schema_mismatch`): any sim command before a MATCHING `hello`
-        /// (a client built for a different R, or one that skipped the handshake) is refused — so a wrong-R
-        /// client can never mutate/observe the sim, which is the contract `dispatch`'s advisory `hello`
-        /// only reports. An oversized frame (`> CMD_CAP`) drops the session rather than pre-allocating it.
+        /// ENFORCES the hello handshake (`unauthorized`): any sim command before a hello that matches BOTH
+        /// this server's R-fingerprint AND its capability token (`auth_token`, if set) is refused — so a
+        /// wrong-R OR unauthenticated client can never mutate/observe the sim, the contract `dispatch`'s
+        /// advisory `hello` only reports. An oversized frame (`> CMD_CAP`) drops the session unallocated.
         pub fn serveSession(self: *Self, io: std.Io, gpa: Allocator, server: *net.Server, max_cmds: usize) !void {
             var stream = try server.accept(io);
             defer stream.close(io);
@@ -319,10 +383,11 @@ pub fn ControlServer(comptime R: type, comptime systems: []const Sys(R)) type {
                     };
                     defer dec.deinit();
                     if (dec.cmd == .hello) {
-                        authed = std.mem.eql(u8, dec.cmd.hello, self.fp_bytes);
+                        // gate on BOTH the R-fingerprint and the capability token (if a secret is set)
+                        authed = self.handshakeOk(dec.cmd.hello.fingerprint, dec.cmd.hello.token);
                         try cw.writeResponse(&osink, .{ .hello_ok = .{ .ok = authed } });
                     } else if (!authed) {
-                        try cw.writeResponse(&osink, .{ .err = .schema_mismatch }); // refuse: no matching hello yet
+                        try cw.writeResponse(&osink, .{ .err = .unauthorized }); // refuse: no valid (R + token) hello yet
                     } else {
                         try self.dispatch(gpa, dec.sim_id, dec.cmd, &osink);
                     }
@@ -365,6 +430,32 @@ const set_a = [_]Sys(TR){schedule.system(TR, "incA", incA)};
 const set_b = [_]Sys(TR){schedule.system(TR, "incB", incB)};
 const srcs = [_]reload.SystemSource(TR){ reload.inProcessSource(TR, &set_a), reload.inProcessSource(TR, &set_b) };
 const test_sets = control.SetTable(TR){ .sources = &srcs };
+
+// A COUNTING source double — proves the dlopen-handle refcount (inProcessSource's load/unload are no-ops,
+// so they cannot witness it). Each set_id maps to its own counter; the server must load a shared set_id
+// exactly ONCE across N sims and unload it exactly ONCE at the last release.
+const LoadCount = struct { loads: u32 = 0, unloads: u32 = 0 };
+var count0: LoadCount = .{};
+var count1: LoadCount = .{};
+fn cLoad0(ctx: *anyopaque) anyerror!reload.SystemSet(TR) {
+    @as(*LoadCount, @ptrCast(@alignCast(ctx))).loads += 1;
+    return .{ .systems = &set_a };
+}
+fn cLoad1(ctx: *anyopaque) anyerror!reload.SystemSet(TR) {
+    @as(*LoadCount, @ptrCast(@alignCast(ctx))).loads += 1;
+    return .{ .systems = &set_b };
+}
+fn cUnload0(ctx: *anyopaque) void {
+    @as(*LoadCount, @ptrCast(@alignCast(ctx))).unloads += 1;
+}
+fn cUnload1(ctx: *anyopaque) void {
+    @as(*LoadCount, @ptrCast(@alignCast(ctx))).unloads += 1;
+}
+const counting_srcs = [_]reload.SystemSource(TR){
+    .{ .ctx = &count0, .loadFn = cLoad0, .unloadFn = cUnload0 },
+    .{ .ctx = &count1, .loadFn = cLoad1, .unloadFn = cUnload1 },
+};
+const counting_sets = control.SetTable(TR){ .sources = &counting_srcs };
 
 fn seedCounter(gpa: Allocator) Allocator.Error!worldmod.World(TR) {
     var w = worldmod.World(TR).init(0);
@@ -510,11 +601,98 @@ test "snapshot reflects live state; migrate surrenders the sim with canonical by
     try testing.expect(rm.resp.migrated.bytes.len > 0);
     try testing.expect(srv.sims.get(1) == null); // surrendered
 
-    // a hello with the right fingerprint succeeds; a wrong one is refused
-    var rh = try sendCmd(&srv, gpa, 0, .{ .hello = srv.fp_bytes });
+    // a hello with the right fingerprint succeeds; a wrong one is refused (token-less server)
+    var rh = try sendCmd(&srv, gpa, 0, .{ .hello = .{ .fingerprint = srv.fp_bytes, .token = "" } });
     defer rh.deinit();
     try testing.expect(rh.resp.hello_ok.ok);
-    var rh2 = try sendCmd(&srv, gpa, 0, .{ .hello = "wrong" });
+    var rh2 = try sendCmd(&srv, gpa, 0, .{ .hello = .{ .fingerprint = "wrong", .token = "" } });
     defer rh2.deinit();
     try testing.expect(!rh2.resp.hello_ok.ok);
+}
+
+test "auth: with a secret set, the right fingerprint + WRONG token is refused; the right token is accepted" {
+    const gpa = testing.allocator;
+    var srv = try CS.init(gpa, test_sets);
+    srv.auth_token = "s3cr3t"; // the capability secret the AI operator must present
+    defer srv.deinit();
+    try srv.spawn(1, try seedCounter(gpa), 0);
+
+    // right R, NO token → handshake fails (a token IS required now)
+    var r0 = try sendCmd(&srv, gpa, 0, .{ .hello = .{ .fingerprint = srv.fp_bytes, .token = "" } });
+    defer r0.deinit();
+    try testing.expect(!r0.resp.hello_ok.ok);
+    // right R, WRONG token → fails
+    var r1 = try sendCmd(&srv, gpa, 0, .{ .hello = .{ .fingerprint = srv.fp_bytes, .token = "guess" } });
+    defer r1.deinit();
+    try testing.expect(!r1.resp.hello_ok.ok);
+    // right R, RIGHT token → succeeds
+    var r2 = try sendCmd(&srv, gpa, 0, .{ .hello = .{ .fingerprint = srv.fp_bytes, .token = "s3cr3t" } });
+    defer r2.deinit();
+    try testing.expect(r2.resp.hello_ok.ok);
+    // right token but WRONG R → still refused (both must match)
+    var r3 = try sendCmd(&srv, gpa, 0, .{ .hello = .{ .fingerprint = "nope", .token = "s3cr3t" } });
+    defer r3.deinit();
+    try testing.expect(!r3.resp.hello_ok.ok);
+}
+
+test "the dlopen set refcount: N sims share ONE load of a set_id; unload only at the last release" {
+    const gpa = testing.allocator;
+    count0 = .{};
+    count1 = .{};
+    {
+        var srv = try ControlServer(TR, &set_a).init(gpa, counting_sets);
+        defer srv.deinit();
+
+        try srv.spawn(1, try seedCounter(gpa), 0); // set 0: load #1
+        var rf = try sendCmd(&srv, gpa, 1, .{ .fork = .{ .new_sim_id = 2, .diverged_inputs = &.{}, .tick_budget = 1 } });
+        rf.deinit(); // fork shares set 0 (rc 1→2) — must NOT trigger a 2nd load (a real .so would AlreadyLoaded)
+        try testing.expectEqual(@as(u32, 1), count0.loads);
+        try testing.expectEqual(@as(u32, 0), count0.unloads);
+
+        // reload sim 1 to set 1 (load #1 of set 1, rc set0 2→1 — still held by the fork, so NOT unloaded yet)
+        var rr = try sendCmd(&srv, gpa, 1, .{ .reload = .{ .set_id = 1 } });
+        rr.deinit();
+        try testing.expectEqual(@as(u32, 1), count1.loads);
+        try testing.expectEqual(@as(u32, 0), count0.unloads); // fork (sim 2) still references set 0
+    } // srv.deinit releases sim1's set1 (last → unload) and sim2's set0 (last → unload)
+    try testing.expectEqual(@as(u32, 1), count0.unloads); // exactly once, despite a parent+fork sharing it
+    try testing.expectEqual(@as(u32, 1), count1.unloads);
+}
+
+test "fork is refcount-balanced under allocation failure at EVERY point (no orphaned set acquire)" {
+    // For every allocation-failure index in spawn+fork, after teardown the set's loads MUST equal its
+    // unloads — i.e. no acquireSet is ever orphaned, including the .fork put-failure path (the regression:
+    // a child that forkSim acquired but `self.sims.put` failed to register must still be released). A
+    // LOCAL counting source per iteration keeps the balance check per-run; an imbalance = a leaked handle.
+    var fail_index: usize = 0;
+    while (fail_index < 256) : (fail_index += 1) {
+        var counts: LoadCount = .{};
+        const local_srcs = [_]reload.SystemSource(TR){
+            .{ .ctx = &counts, .loadFn = cLoad0, .unloadFn = cUnload0 },
+            .{ .ctx = &counts, .loadFn = cLoad1, .unloadFn = cUnload1 },
+        };
+        const local_sets = control.SetTable(TR){ .sources = &local_srcs };
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const gpa = fa.allocator();
+        {
+            var srv = ControlServer(TR, &set_a).init(gpa, local_sets) catch {
+                // OOM building the server before any set was acquired → nothing to balance
+                try testing.expectEqual(counts.loads, counts.unloads);
+                continue;
+            };
+            defer srv.deinit(); // releases every surviving sim's set on teardown
+            const w0 = seedCounter(gpa) catch {
+                continue;
+            };
+            srv.spawn(1, w0, 0) catch {
+                continue;
+            }; // spawn's own errdefer releases on a mid-spawn OOM
+            var rf = sendCmd(&srv, gpa, 1, .{ .fork = .{ .new_sim_id = 2, .diverged_inputs = &.{}, .tick_budget = 0 } }) catch {
+                continue; // fork OOM (incl. the put-failure path) must NOT orphan the acquire — checked post-deinit
+            };
+            rf.deinit();
+        }
+        // INVARIANT (the bug's witness): every load is paired by an unload, no matter where OOM struck.
+        try testing.expectEqual(counts.loads, counts.unloads);
+    }
 }

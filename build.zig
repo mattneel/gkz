@@ -47,6 +47,27 @@ pub fn build(b: *std.Build) void {
     // (a self-relocating static-pie's internal pointers read as garbage under dlopen).
     const test_step = b.step("test", "Run the kernel suite under Debug/ReleaseSafe/ReleaseFast (determinism gate)");
     const modes = [_]std.builtin.OptimizeMode{ .Debug, .ReleaseSafe, .ReleaseFast };
+
+    // §17 cross-ENDIAN "across machines" witness: a BIG-ENDIAN (s390x) build of the TCP worker daemon. The
+    // proc gate spawns it under qemu-s390x and drives it from this little-endian x86_64 client over a REAL
+    // TCP socket — proving two DIFFERENT-ARCH peers transact byte-identically over a LIVE socket (stronger
+    // than `zig build cross`, which proves the codec is endian-stable in isolation, not that two arches agree
+    // over a socket). Built once (Debug — the witness is the transport/codec, not the optimize mode); a
+    // static ELF qemu-user runs directly. Linux-only (the gate spawns qemu); built unconditionally (a
+    // cross-compile is host-OS-independent) but only injected into the Linux-guarded proc gate below.
+    const net_worker_s390x = blk: {
+        const s390x_target = b.resolveTargetQuery(.{ .cpu_arch = .s390x, .os_tag = .linux });
+        const fpz_s390x = b.dependency("fpz", .{ .target = s390x_target, .optimize = .Debug });
+        const gkz_s390x = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = s390x_target, .optimize = .Debug });
+        gkz_s390x.addImport("fpz", fpz_s390x.module("fpz"));
+        break :blk b.addExecutable(.{ .name = "gkz_net_worker_s390x", .root_module = b.createModule(.{
+            .root_source_file = b.path("src/proc/net_worker_main.zig"),
+            .target = s390x_target,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "gkz", .module = gkz_s390x }},
+        }) });
+    };
+
     for (modes) |mode| {
         const fpz_mode = b.dependency("fpz", .{ .target = target, .optimize = mode });
         const tmod = b.createModule(.{
@@ -130,6 +151,8 @@ pub fn build(b: *std.Build) void {
             const proc_opts = b.addOptions();
             proc_opts.addOptionPath("worker_exe_path", worker.getEmittedBin()); // injects path + build-graph dep
             proc_opts.addOptionPath("net_worker_exe_path", net_worker.getEmittedBin()); // §17 TCP daemon path + dep
+            proc_opts.addOptionPath("net_worker_s390x_path", net_worker_s390x.getEmittedBin()); // §17 cross-endian daemon
+            proc_opts.addOption([]const u8, "qemu_s390x", "qemu-s390x"); // qemu-user wrapper for the s390x daemon
 
             const gkz_pgate_mod = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = mode });
             gkz_pgate_mod.addImport("fpz", fpz_mode.module("fpz"));

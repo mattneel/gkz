@@ -261,8 +261,14 @@ server, a **`ControlServer` drives live sims** (step/reload/fork/snapshot/migrat
 socket, and a **`networkExecutor` distributes work across machines** — the gate proves a live socket-driven
 session is **bit-identical to its deterministic replay**, and that a job computed in a **genuinely separate
 OS process** carried over TCP equals the in-process bytes and the pinned cross-mode digest (localhost is only
-the test substrate; nothing in the path assumes a co-located peer). The remaining refinements are now
-narrow: auth/TLS, and a physical second host as a *stronger* (not *missing*) network witness (see PLAN §17).
+the test substrate; nothing in the path assumes a co-located peer). It even drives a **big-endian s390x
+daemon under qemu over a real TCP socket** to a byte-identical digest — two different-arch peers transacting
+over a live connection (gate (k)). A **live-stall read deadline** (`Io.Select` race + cancelation) harvests a
+wedged peer as `timed_out`; multi-sim **dlopen handle refcounting** lets forks share a `.so` safely; and a
+**capability-token handshake** refuses an unauthenticated control client. Transport *encryption* (TLS) is the
+one deliberately-external piece — a §14 transport-seam adapter on the `Stream` (std ships only a TLS client),
+not a kernel clause; a physical second host is the only environmental gap (the cross-endian process witness
+is its substance). See PLAN §17.16.
 
 ### Phase 10 — Content as data (SPEC §11)
 
@@ -338,7 +344,8 @@ contract:
 - **Cross-architecture determinism gate** (`zig build cross`): every pin re-checked under qemu on aarch64/s390x/arm/mips — the {32,64}-bit × {LE,BE} matrix ✅
 - **Reload/migrate control trigger** (§12↔§13, `control.zig`): a captured, replayable `ControlSchedule`; reload+migrate driven reproducibly at tick boundaries; the exogenous trigger captured live and never re-invoked on replay (cross-arch pinned) ✅
 - **Control-plane completion** (§13/§17): the generic multi-phase **`runSession`** (reload+migrate across `R`-retyping phases); the live **`ControlServer`** write surface (step/reload/fork/snapshot/migrate over a `GKZC2`/`GKZD1` command socket) with a **driven-session == deterministic-replay** gate; the across-machines **`networkExecutor`** (TCP) gated over a real socket *and* a genuinely separate OS process ✅
-- **Next** — control-plane **auth/TLS**, a **physical second host** as a stronger (not missing) network witness, and persistent-connection refinements (see PLAN §17.14)
+- **Control-plane residuals closed** (§17.16): a **read deadline** (Io.Select race; stalled peer → `timed_out`), multi-sim **dlopen set refcounting**, a **cross-endian "across machines" witness** (s390x daemon under qemu over real TCP == pinned digest), and a **capability-token auth** handshake — all built + gated. TLS stays a §14 transport-seam adapter (no TLS server in std; protocol is transport-agnostic); a physical second host is the only environmental gap ✅
+- **Next** — TLS transport adapter (edge-termination / external lib on the `Stream` seam), and persistent-connection/operator-tooling refinements
 
 See [`PLAN.md`](./PLAN.md) §6 for the full phase map.
 

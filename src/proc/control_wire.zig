@@ -20,7 +20,11 @@ pub const WIRE_VERSION: u16 = 1;
 
 /// The AI control-command vocabulary — DATA + selector ids only (no `R`, no fn-ptrs).
 pub const ControlCommand = union(enum) {
-    hello: []const u8, // R-fingerprint handshake bytes (currentFingerprint(R))
+    // R-fingerprint handshake + a capability token. `fingerprint` is currentFingerprint(R)'s bytes (so a
+    // wrong-R client is refused); `token` is the shared secret the server may require before any command
+    // (empty when the server runs token-less / open). The control plane crosses a socket to a privileged
+    // mutate surface, so a server with a configured secret refuses an unauthenticated client.
+    hello: struct { fingerprint: []const u8, token: []const u8 },
     query: []const u8, // a GKZQ1 query frame, delegated verbatim to query/wire.respond
     step: struct { n: u64, inline_inputs: []const Input }, // advance n ticks (drives a divergent live trajectory)
     reload: struct { set_id: u16 }, // swap the live system set (SAME R)
@@ -38,7 +42,8 @@ pub const ControlErr = enum(u16) {
     no_such_migration = 4,
     capture_full = 5,
     sim_id_in_use = 6,
-    schema_mismatch = 7,
+    schema_mismatch = 7, // the hello fingerprint did not match this server's R
+    unauthorized = 8, // a command before a valid hello, or a hello whose token did not match the server secret
     _,
 };
 
@@ -103,7 +108,10 @@ pub fn writeCommand(sink: *serialize.ByteSink, sim_id: u32, cmd: ControlCommand)
     try serialize.putInt(sink, u16, WIRE_VERSION);
     try serialize.putInt(sink, u8, @intFromEnum(cmd));
     switch (cmd) {
-        .hello => |b| try writeBytes(sink, b),
+        .hello => |h| {
+            try writeBytes(sink, h.fingerprint);
+            try writeBytes(sink, h.token);
+        },
         .query => |b| try writeBytes(sink, b),
         .step => |s| {
             try serialize.putInt(sink, u64, s.n);
@@ -141,7 +149,7 @@ pub fn decodeCommand(gpa: Allocator, bytes: []const u8) (serialize.Error || Allo
     if (try serialize.getInt(&r, u16) != WIRE_VERSION) return error.UnsupportedFormat;
     const tag = try serialize.getInt(&r, u8);
     const cmd: ControlCommand = switch (tag) {
-        0 => .{ .hello = try readBytes(a, &r) },
+        0 => .{ .hello = .{ .fingerprint = try readBytes(a, &r), .token = try readBytes(a, &r) } },
         1 => .{ .query = try readBytes(a, &r) },
         2 => .{ .step = .{ .n = try serialize.getInt(&r, u64), .inline_inputs = try readInputs(a, &r) } },
         3 => .{ .reload = .{ .set_id = try serialize.getInt(&r, u16) } },
@@ -248,7 +256,7 @@ fn roundTripCmd(gpa: Allocator, sim_id: u32, cmd: ControlCommand) !void {
 test "every command arm round-trips byte-identically" {
     const gpa = testing.allocator;
     const cmds = .{
-        ControlCommand{ .hello = "fp-bytes" },
+        ControlCommand{ .hello = .{ .fingerprint = "fp-bytes", .token = "secret" } },
         ControlCommand{ .query = "GKZQ1..." },
         ControlCommand{ .step = .{ .n = 5, .inline_inputs = &.{.{ .tick = 1, .commands = &.{.{ .actor = .{ .index = 0, .generation = 0 }, .verb = 1 }} }} } },
         ControlCommand{ .reload = .{ .set_id = 2 } },

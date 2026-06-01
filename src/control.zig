@@ -115,8 +115,11 @@ pub fn ControlOutcome(comptime R: type) type {
 /// then `reload.reloadAt` by name (the World no-op), then unload the prior set AFTER the swap+recompute
 /// (the dlopen "valid only while open" hazard). `new_exec` is computed BEFORE freeing the old, so an error
 /// leaves `exec` pointing at the still-valid old slice (the caller's errdefer frees it exactly once).
-/// Exported so the live control server's reload (control_server.doReload) is BIT-IDENTICAL to the
-/// replay/driver path — a single source for the swap semantics.
+/// Used by both control drivers (runWithControl/captureWithControl) for the single-sim reload. The live
+/// control server's reload (`control_server.reloadSim`) is a refcount-AWARE re-implementation with the
+/// IDENTICAL World semantics (this same `reloadAt` no-op + `execOrderDynamic` recompute) — it cannot call
+/// this directly because it must share+refcount one dlopen handle across multiple in-process sims, which a
+/// raw `sets.load`/`sets.unload` here does not; the produced World (hence every digest) is the same.
 pub fn applyReload(
     comptime R: type,
     gpa: Allocator,

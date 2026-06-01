@@ -467,14 +467,14 @@ test "(g) control plane: a live socket-DRIVEN session == its deterministic repla
         const w = &sw.interface;
         const r = &sr.interface;
 
-        // ENFORCEMENT: a command BEFORE a matching hello is refused (schema_mismatch) — the handshake is
-        // not advisory over a real session (a wrong-R / no-hello client cannot touch the sim).
+        // ENFORCEMENT: a command BEFORE a valid hello is refused (unauthorized) — the handshake is not
+        // advisory over a real session (a wrong-R / unauthenticated / no-hello client cannot touch the sim).
         var r0 = try driveCmd(gpa, w, r, 1, .{ .step = .{ .n = 1, .inline_inputs = &.{} } });
         defer r0.deinit();
-        try testing.expectEqual(cwire.ControlErr.schema_mismatch, r0.resp.err);
+        try testing.expectEqual(cwire.ControlErr.unauthorized, r0.resp.err);
 
-        // hello (R handshake), then step 2 (set_a: +1,+1), reload→set_b, step 1 (set_b: +10)
-        var rh = try driveCmd(gpa, w, r, 1, .{ .hello = srv.fp_bytes });
+        // hello (R handshake; token-less server), then step 2 (set_a: +1,+1), reload→set_b, step 1 (set_b: +10)
+        var rh = try driveCmd(gpa, w, r, 1, .{ .hello = .{ .fingerprint = srv.fp_bytes, .token = "" } });
         defer rh.deinit();
         try testing.expect(rh.resp.hello_ok.ok);
         var r1 = try driveCmd(gpa, w, r, 1, .{ .step = .{ .n = 2, .inline_inputs = &.{} } });
@@ -599,6 +599,60 @@ test "(i) networkExecutor across a REAL separate process (the multi-machine seam
     // THE multi-machine witness: bytes computed in a SEPARATE OS process, carried over TCP, are bit-identical
     // to the in-process result and the pinned cross-mode digest. Localhost is merely the test substrate —
     // nothing in the path assumes a co-located peer.
+    try testing.expectEqual(AGG_DIGEST, digest(net_out.items));
+    var dec = try proc.job.decodeResult(u64, gpa, net_out.items);
+    defer dec.deinit();
+    try testing.expectEqual(@as(i128, 9), dec.result.aggregate.agg.sum);
+}
+
+test "(k) networkExecutor across a REAL BIG-ENDIAN process (s390x/qemu) over TCP == pinned AGG_DIGEST" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var jb = try buildJob(gpa, LO, HI, 0);
+    defer jb.deinit(gpa);
+
+    // Spawn the BIG-ENDIAN s390x daemon under qemu-user. qemu-user forwards the guest's socket syscalls to
+    // THIS host's kernel, so its TCP listener is reachable from this little-endian x86_64 client over a real
+    // loopback socket — two different-arch peers on one live connection. (`zig build cross` proves the codec
+    // is endian-stable in isolation; THIS proves two arches actually agree transacting over a socket.)
+    var child = std.process.spawn(io, .{
+        .argv = &.{ build_opts.qemu_s390x, build_opts.net_worker_s390x_path, "net-worker", "1" },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch |e| switch (e) {
+        // qemu-s390x absent / spawn denied → honest skip (the host x86_64 (i) gate already proves the
+        // separate-process path; this is the stronger cross-endian witness, gated where qemu exists).
+        error.FileNotFound, error.AccessDenied, error.SystemResources, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => return error.SkipZigTest,
+        else => return e,
+    };
+    errdefer _ = child.kill(io);
+
+    // 4-byte LE port handshake. If the guest couldn't bind (qemu-user networking unsupported here), it exits
+    // without publishing a port → EOF → honest skip (this env can't host the witness), never a false failure.
+    var pbuf: [64]u8 = undefined;
+    var cr = child.stdout.?.reader(io, &pbuf);
+    const port = std.mem.readInt(u32, cr.interface.takeArray(4) catch {
+        _ = child.kill(io);
+        return error.SkipZigTest;
+    }, .little);
+
+    var net_out: std.ArrayList(u8) = .empty;
+    defer net_out.deinit(gpa);
+    var s2 = serialize.ByteSink{ .list = &net_out, .gpa = gpa };
+    var ctx = proc.NetCtx{ .io = io, .host = "127.0.0.1", .port = @intCast(port), .timeout_ms = 60_000 }; // qemu is slow → generous deadline
+    const outcome = try proc.networkExecutor(&ctx).run(gpa, jb.items, &s2);
+
+    const term = try child.wait(io);
+    switch (outcome) {
+        .spawn_failed => return error.SkipZigTest,
+        .crashed => return error.TestUnexpectedResult, // it published a port (networking works) → a crash now is real
+        .ok => {},
+    }
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    // THE cross-endian multi-machine witness: a job aggregated by a BIG-ENDIAN peer, carried over TCP, is
+    // byte-identical to this little-endian host's pinned digest. The canonical-LE codec holds across the wire.
     try testing.expectEqual(AGG_DIGEST, digest(net_out.items));
     var dec = try proc.job.decodeResult(u64, gpa, net_out.items);
     defer dec.deinit();
