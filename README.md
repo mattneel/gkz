@@ -2,6 +2,10 @@
 
 A **deterministic, fully observable, forkable simulation kernel** in Zig.
 
+**▶ Live demo:** [**mattneel.github.io/gkz**](https://mattneel.github.io/gkz/) — the canonical roguelike sim
+core compiled to WebAssembly and stepped in your browser. The same `step` that runs natively; its per-tick
+content hash is bit-identical to a native run.
+
 This is not a game engine in the Unity/Unreal sense. It is a deterministic state machine that
 *expresses* games, with rendering, audio, input, and networking demoted to peripheral adapters. Its
 lineage is [TigerBeetle](https://tigerbeetle.com/) (deterministic state machine + simulation testing),
@@ -43,11 +47,12 @@ is an *optional* operational shell for running sims at scale, not the authoring 
 - **Skills for AI coding harnesses:** [`.claude/skills/`](./.claude/skills/) — `gkz-overview` (what it is
   + the determinism contract), `gkz-authoring` (write the sim core), `gkz-measure` (drive + measure the
   loop).
-- **In the browser:** the sim path has no IO/threads/clock/syscall, so gkz compiles to **WebAssembly** and
-  the browser becomes the §14 view seam (JS owns rendering, reads state from linear memory). The example
-  ships `zig build wasm` / `wasm-emcc` (Emscripten) / `wasm-check` — the last proves the in-browser content
-  digest is **bit-identical to a native run** (wasm32-freestanding, wasm32-emscripten verified; wasm64
-  builds, runtime-gated by nascent memory64 support).
+- **In the browser** ([live demo](https://mattneel.github.io/gkz/))**:** the sim path has no
+  IO/threads/clock/syscall, so gkz compiles to **WebAssembly** and the browser becomes the §14 view seam (JS
+  owns rendering, reads state from linear memory). The example ships `zig build wasm` / `wasm-emcc`
+  (Emscripten) / `wasm-check` — the last proves the in-browser content digest is **bit-identical to a native
+  run** (wasm32-freestanding, wasm32-emscripten verified; wasm64 builds, runtime-gated by nascent memory64
+  support). Auto-deployed to Pages by [`.github/workflows/pages.yml`](./.github/workflows/pages.yml).
 
 ---
 

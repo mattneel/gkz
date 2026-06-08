@@ -94,6 +94,9 @@ starting skeleton.
 
 ## Run it in the browser (WASM)
 
+**▶ Live: [mattneel.github.io/gkz](https://mattneel.github.io/gkz/)** (auto-deployed from `master` by
+`.github/workflows/pages.yml`).
+
 The sim core touches no `std.Io` / threads / clock / syscall, so it compiles to a WebAssembly sandbox and
 the **browser becomes the §14 view seam** — JS owns the render loop and reads entity positions out of the
 module's linear memory each tick. `src/wasm.zig` is the C-ABI surface (`rl_init`/`rl_step`/`rl_live`/…).
