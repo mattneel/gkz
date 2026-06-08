@@ -43,8 +43,17 @@ const SEED_START = 7;
 let exp, mem, seed = SEED_START, paused = false, acc = 0;
 
 // Freestanding wasm: no host imports. Serve this dir (e.g. `python3 -m http.server`) — fetch needs http(s).
-const { instance } = await WebAssembly.instantiateStreaming(fetch("roguelike.wasm"), {});
-exp = instance.exports;
+// instantiateStreaming needs the host to send Content-Type: application/wasm; fall back to a buffer
+// instantiate for any static host that mislabels it.
+async function loadWasm(url) {
+  try {
+    return (await WebAssembly.instantiateStreaming(fetch(url), {})).instance;
+  } catch {
+    const bytes = await (await fetch(url)).arrayBuffer();
+    return (await WebAssembly.instantiate(bytes, {})).instance;
+  }
+}
+exp = (await loadWasm("roguelike.wasm")).exports;
 mem = exp.memory;
 
 const EXTENT = exp.rl_extent();        // grid is [-EXTENT, EXTENT] on each axis

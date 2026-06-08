@@ -91,3 +91,31 @@ exe_mod.addImport("gkz", gkz);
 
 A real game would `.path` to a checkout or `.url`-pin a release instead. Copy this directory as a
 starting skeleton.
+
+## Run it in the browser (WASM)
+
+The sim core touches no `std.Io` / threads / clock / syscall, so it compiles to a WebAssembly sandbox and
+the **browser becomes the §14 view seam** — JS owns the render loop and reads entity positions out of the
+module's linear memory each tick. `src/wasm.zig` is the C-ABI surface (`rl_init`/`rl_step`/`rl_live`/…).
+
+```sh
+zig build wasm        # → zig-out/web/roguelike.wasm (wasm32) + roguelike64.wasm (wasm64), freestanding
+zig build wasm-emcc   # → zig-out/web/roguelike-emcc.{js,wasm} via Emscripten (needs emcc on PATH)
+zig build wasm-check  # build wasm + assert its content digest == the native run, bit for bit (needs node)
+
+# see the demo (fetch needs http, not file://):
+zig build wasm && (cd zig-out/web && python3 -m http.server) # then open http://localhost:8000
+```
+
+[`web/index.html`](web/index.html) is a self-contained Canvas page that loads `roguelike.wasm`, steps the
+sim, and draws the grid. [`web/check.mjs`](web/check.mjs) is the determinism harness.
+
+**The headline property:** a browser playthrough is *bit-identical* to a native run — `zig build
+wasm-check` runs the freestanding module under node and asserts its per-tick content digest equals
+`roguelike digest 7 30` exactly (wasm32 is a 32-bit little-endian target, like the gated `arm`). So you can
+record a run in the browser and replay/VOPR-minimize it natively, or vice versa.
+
+Targets: **wasm32-freestanding** (the browser target — runs + determinism-verified), **wasm32-emscripten**
+(a `.js`+`.wasm` pair with libc/JS glue, for demos that want console/fs/SDL on top of the sim — also
+digest-identical), and **wasm64-freestanding** (builds and is well-formed, but memory64 is still nascent in
+shipping runtimes — node v22 and current browsers can't instantiate 64-bit-table modules yet).

@@ -1,0 +1,67 @@
+# Build the wasm32 roguelike example and publish it to GitHub Pages.
+#
+# The gkz sim core compiles to freestanding WebAssembly (no IO/threads/clock/syscall on the sim path), so
+# `zig build wasm` produces a self-contained zig-out/web/ (index.html + roguelike.wasm) that is just a
+# static site — this workflow builds it and deploys it to Pages.
+#
+# One-time setup: repo Settings → Pages → Build and deployment → Source = "GitHub Actions".
+# The site then lives at https://mattneel.github.io/gkz/ (the demo's fetches are relative, so the
+# /gkz/ project-page base path is fine).
+
+name: Deploy roguelike WASM demo
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "src/**" # the kernel (the example links it by path)
+      - "build.zig"
+      - "build.zig.zon"
+      - "examples/roguelike/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch: {} # allow manual redeploys
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# one Pages deploy at a time; let an in-flight deploy finish rather than cancelling it
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build the wasm32 roguelike demo
+        working-directory: examples/roguelike
+        run: zig build wasm # → zig-out/web/{index.html, roguelike.wasm, roguelike64.wasm}; fetches the fpz dep over https
+
+      - name: Sanity-check the build output
+        run: test -f examples/roguelike/zig-out/web/index.html && test -f examples/roguelike/zig-out/web/roguelike.wasm
+
+      - uses: actions/configure-pages@v5
+
+      - name: Upload the static site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: examples/roguelike/zig-out/web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
