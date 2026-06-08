@@ -43,6 +43,11 @@ is an *optional* operational shell for running sims at scale, not the authoring 
 - **Skills for AI coding harnesses:** [`.claude/skills/`](./.claude/skills/) — `gkz-overview` (what it is
   + the determinism contract), `gkz-authoring` (write the sim core), `gkz-measure` (drive + measure the
   loop).
+- **In the browser:** the sim path has no IO/threads/clock/syscall, so gkz compiles to **WebAssembly** and
+  the browser becomes the §14 view seam (JS owns rendering, reads state from linear memory). The example
+  ships `zig build wasm` / `wasm-emcc` (Emscripten) / `wasm-check` — the last proves the in-browser content
+  digest is **bit-identical to a native run** (wasm32-freestanding, wasm32-emscripten verified; wasm64
+  builds, runtime-gated by nascent memory64 support).
 
 ---
 

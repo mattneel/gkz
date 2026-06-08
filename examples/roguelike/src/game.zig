@@ -50,7 +50,7 @@ pub const Slain = struct {
 
 // --- the hero is always spawned first, so it is entity {index 0, generation 0} -----------------------
 pub const HERO = gkz.Entity{ .index = 0, .generation = 0 };
-const ARENA: i32 = 6; // a 13x13 arena, [-6, 6] on each axis
+pub const ARENA: i32 = 6; // a 13x13 arena, [-6, 6] on each axis
 const MAX_ENTITIES = 256; // a system's allocation-free scratch bound (this game's levels stay well under)
 
 fn cheb(a: Position, b: Position) i32 {

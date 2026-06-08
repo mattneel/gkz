@@ -63,6 +63,11 @@ Write the deterministic core, then iterate on it with **measurement, not vibes**
 path dependency — the downstream template. `src/game.zig` is the authored core; `src/main.zig` is the
 measure-and-iterate loop. `zig build run` narrates the whole loop; `zig build test` pins it.
 
+Because the sim path has no IO/threads/clock/syscall, gkz also compiles to **WebAssembly** (the browser is
+then the §14 view seam: JS owns the render loop, reads state out of linear memory). The example ships
+`src/wasm.zig` + `web/` and `zig build wasm` / `wasm-emcc` / `wasm-check` — the last asserts the in-browser
+digest is **bit-identical** to the native run (wasm32 is 32-bit LE, like the gated `arm`).
+
 ## Public front door
 
 `@import("gkz")` (`src/root.zig`) re-exports everything: `Registry`, `World`, `Entity`; `system`/`Sys`,

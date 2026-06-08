@@ -20,6 +20,18 @@ pub fn main(init: std.process.Init) !void {
     const out = &fw.interface;
     defer out.flush() catch {};
 
+    // `roguelike digest <seed> <ticks>` — print just the end-state content hash (decimal u64). Used by the
+    // WASM determinism check (web/check.mjs) to assert the browser sim equals this native run, bit for bit.
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "digest")) {
+        const seed = try std.fmt.parseInt(u64, args[2], 10);
+        const ticks = try std.fmt.parseInt(usize, args[3], 10);
+        var w = try runTicks(gpa, try game.seedWorld(gpa, seed), ticks);
+        defer w.deinit(gpa);
+        try out.print("{d}\n", .{(try w.digest(gpa)).hash});
+        return;
+    }
+
     try out.writeAll("=== gkz roguelike — the author's measure-and-iterate loop ===\n\n");
 
     // (1) AUTHOR + STEP. step : (World, Input) -> World is pure; the World is a value. Run the arena and

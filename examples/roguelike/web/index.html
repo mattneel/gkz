@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>gkz roguelike — wasm</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0b0d10; color: #cdd6e0; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; display: grid; place-items: center; min-height: 100vh; }
+  .wrap { display: grid; gap: 12px; padding: 20px; }
+  h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  .sub { color: #7c8794; margin: 0; }
+  canvas { background: #111418; border: 1px solid #232a33; border-radius: 8px; image-rendering: pixelated; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  button { background: #1b2027; color: #cdd6e0; border: 1px solid #2c3744; border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
+  button:hover { border-color: #3d4b5c; }
+  .stat { color: #7c8794; } .stat b { color: #cdd6e0; font-weight: 600; }
+  .hero { color: #5aa9ff; } .mob { color: #ff6b6b; }
+  code { color: #9ece6a; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>gkz roguelike <span class="sub">— the deterministic sim core, compiled to wasm32 and stepped in the browser</span></h1>
+  <canvas id="c" width="416" height="416"></canvas>
+  <div class="row">
+    <button id="restart">↻ new seed</button>
+    <button id="pause">⏸ pause</button>
+    <span class="stat">seed <b id="seed">7</b></span>
+    <span class="stat">tick <b id="tick">0</b></span>
+    <span class="stat">digest <code id="digest">—</code></span>
+    <span class="stat"><span class="hero">■ hero</span> · <span class="mob">■ monsters</span></span>
+  </div>
+  <p class="sub" style="max-width:60ch">
+    The Zig kernel runs <em>headless</em> — this page is the §14 <em>view seam</em>: it owns the render loop
+    and reads entity positions out of the module's linear memory each tick. The <code id="dnote">digest</code>
+    is the per-tick content hash; it is <b>bit-identical</b> to a native run (verified by
+    <code>node web/check.mjs</code>), so a browser playthrough records and replays exactly like any other.
+  </p>
+</div>
+<script type="module">
+const SEED_START = 7;
+let exp, mem, seed = SEED_START, paused = false, acc = 0;
+
+// Freestanding wasm: no host imports. Serve this dir (e.g. `python3 -m http.server`) — fetch needs http(s).
+const { instance } = await WebAssembly.instantiateStreaming(fetch("roguelike.wasm"), {});
+exp = instance.exports;
+mem = exp.memory;
+
+const EXTENT = exp.rl_extent();        // grid is [-EXTENT, EXTENT] on each axis
+const N = EXTENT * 2 + 1;
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const CELL = Math.floor(canvas.width / N);
+
+function reset() {
+  exp.rl_init(seed);
+  document.getElementById("seed").textContent = seed;
+  draw();
+}
+
+function draw() {
+  // grid
+  ctx.fillStyle = "#111418"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.strokeStyle = "#1b2129"; ctx.lineWidth = 1;
+  for (let i = 0; i <= N; i++) {
+    ctx.beginPath(); ctx.moveTo(i * CELL + .5, 0); ctx.lineTo(i * CELL + .5, N * CELL); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, i * CELL + .5); ctx.lineTo(N * CELL, i * CELL + .5); ctx.stroke();
+  }
+  // entities: rl_live() fills a scratch buffer with [team,x,y,hp] quads; read it from linear memory
+  const n = exp.rl_live();
+  const view = new Int32Array(mem.buffer, exp.rl_buf(), n * 4);
+  for (let k = 0; k < n; k++) {
+    const team = view[k*4], x = view[k*4+1], y = view[k*4+2], hp = view[k*4+3];
+    const cx = (x + EXTENT) * CELL, cy = (EXTENT - y) * CELL; // +y is up
+    ctx.fillStyle = team === 0 ? "#5aa9ff" : "#ff6b6b";
+    ctx.fillRect(cx + 2, cy + 2, CELL - 4, CELL - 4);
+    ctx.fillStyle = "#0b0d10"; ctx.font = `${Math.floor(CELL*0.42)}px ui-monospace, monospace`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(String(hp), cx + CELL/2, cy + CELL/2);
+  }
+  document.getElementById("tick").textContent = exp.rl_tick().toString();
+  document.getElementById("digest").textContent = "0x" + exp.rl_digest().toString(16).padStart(16, "0");
+}
+
+// ~6 ticks/sec so you can watch the monsters close in and the melee resolve
+let last = performance.now();
+function frame(now) {
+  if (!paused) { acc += now - last; if (acc > 160) { acc = 0; exp.rl_step(); draw(); } }
+  last = now;
+  requestAnimationFrame(frame);
+}
+
+document.getElementById("restart").onclick = () => { seed = (seed * 1664525 + 1013904223) >>> 0; reset(); };
+document.getElementById("pause").onclick = (e) => { paused = !paused; e.target.textContent = paused ? "▶ play" : "⏸ pause"; };
+
+reset();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
