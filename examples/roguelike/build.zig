@@ -70,6 +70,9 @@ pub fn build(b: *std.Build) void {
         wasm.rdynamic = true; // export the `export fn`s (and the linear memory)
         wasm_step.dependOn(&b.addInstallArtifact(wasm, .{ .dest_dir = .{ .override = .{ .custom = "web" } } }).step);
     }
+    // Copy the page into zig-out/web/ next to the .wasm, so the install dir is self-contained and servable:
+    //   zig build wasm && (cd zig-out/web && python3 -m http.server) → open http://localhost:8000
+    wasm_step.dependOn(&b.addInstallFile(b.path("web/index.html"), "web/index.html").step);
 
     // --- WASM via Emscripten: a batteries-included .js + .wasm pair (needs emcc on PATH) ---
     // Emscripten provides a libc/JS glue layer; useful if a demo wants console/fs/SDL on top of the sim.
